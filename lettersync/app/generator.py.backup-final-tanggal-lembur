@@ -1,0 +1,665 @@
+﻿from pathlib import Path
+from docx import Document
+from datetime import datetime
+import subprocess
+
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+
+TEMPLATE_DIR = BASE_DIR / "templates"
+OUTPUT_DIR = BASE_DIR / "output"
+
+WORD_DIR = OUTPUT_DIR / "word"
+PDF_DIR = OUTPUT_DIR / "pdf"
+
+
+def _replace_in_paragraph(paragraph, replacements):
+
+    for old, new in replacements.items():
+
+        new = str(new or "")
+
+        for run in paragraph.runs:
+
+            if old in run.text:
+                run.text = run.text.replace(
+                    old,
+                    new
+                )
+
+        full_text = paragraph.text
+
+        if old in full_text:
+
+            new_text = full_text.replace(
+                old,
+                new
+            )
+
+            if paragraph.runs:
+
+                paragraph.runs[0].text = new_text
+
+                for run in paragraph.runs[1:]:
+                    run.text = ""
+
+
+def _replace_everywhere(doc, replacements):
+
+    for paragraph in doc.paragraphs:
+
+        _replace_in_paragraph(
+            paragraph,
+            replacements
+        )
+
+    for table in doc.tables:
+
+        for row in table.rows:
+
+            for cell in row.cells:
+
+                for paragraph in cell.paragraphs:
+
+                    _replace_in_paragraph(
+                        paragraph,
+                        replacements
+                    )
+
+    for section in doc.sections:
+
+        for paragraph in section.header.paragraphs:
+
+            _replace_in_paragraph(
+                paragraph,
+                replacements
+            )
+
+        for table in section.header.tables:
+
+            for row in table.rows:
+
+                for cell in row.cells:
+
+                    for paragraph in cell.paragraphs:
+
+                        _replace_in_paragraph(
+                            paragraph,
+                            replacements
+                        )
+
+        for paragraph in section.footer.paragraphs:
+
+            _replace_in_paragraph(
+                paragraph,
+                replacements
+            )
+
+        for table in section.footer.tables:
+
+            for row in table.rows:
+
+                for cell in row.cells:
+
+                    for paragraph in cell.paragraphs:
+
+                        _replace_in_paragraph(
+                            paragraph,
+                            replacements
+                        )
+
+
+def _replace_cell_text(cell, new_text):
+
+    new_text = str(new_text or "")
+
+    if not cell.paragraphs:
+
+        cell.text = new_text
+        return
+
+    paragraph = cell.paragraphs[0]
+
+    if paragraph.runs:
+
+        paragraph.runs[0].text = new_text
+
+        for run in paragraph.runs[1:]:
+
+            run.text = ""
+
+    else:
+
+        paragraph.add_run(new_text)
+
+
+def _cell_text(cell):
+
+    return " ".join(
+        line.strip()
+        for line in cell.text.splitlines()
+        if line.strip()
+    )
+
+
+def _find_table_with_header(doc):
+
+    required = [
+        "No",
+        "Hari/Tanggal",
+        "Jam Mulai Lembur",
+        "Jam Selesai Lembur",
+        "Jumlah Jam Lembur",
+        "Laporan Lembur",
+    ]
+
+    for table in doc.tables:
+
+        for row_index, row in enumerate(table.rows):
+
+            texts = [
+                _cell_text(cell).lower()
+                for cell in row.cells
+            ]
+
+            combined = " | ".join(texts)
+
+            score = 0
+
+            for item in required:
+
+                if item.lower() in combined:
+                    score += 1
+
+            if score >= 4:
+
+                return table, row_index
+
+    return None, None
+
+
+def _remove_row(row):
+
+    tbl = row._tr
+
+    tbl.getparent().remove(tbl)
+
+
+def _replace_lembur_template(doc, values):
+    """
+    Mengisi template DAFTAR HADIR KERJA LEMBUR.
+
+    Template asli merupakan dokumen contoh yang terdiri dari:
+    - tabel pertama berisi nomor 1-6
+    - tabel kedua berisi nomor 7
+    - informasi tanda tangan berada di paragraph terpisah.
+
+    Hasil akhir hanya menggunakan satu baris data lembur.
+    """
+
+    nama = str(values.get("NAMA") or "")
+    nip = str(values.get("NIP") or "")
+    unit_kerja = str(values.get("UNIT_KERJA") or "")
+
+    tanggal = str(
+        values.get("TANGGAL_LEMBUR")
+        or values.get("TANGGAL")
+        or ""
+    )
+
+    tanggal_surat = str(
+        values.get("TANGGAL_PEMBUATAN_SURAT")
+        or values.get("TANGGAL_SURAT")
+        or ""
+    )
+
+    jam_mulai = str(values.get("JAM_MULAI") or "")
+    jam_selesai = str(values.get("JAM_SELESAI") or "")
+
+    total = str(
+        values.get("TOTAL_JAM_LEMBUR")
+        or values.get("TOTAL_JAM")
+        or ""
+    )
+
+    laporan = str(
+        values.get("LAPORAN_LEMBUR")
+        or ""
+    )
+
+    # ========================================================
+    # Helper: ganti teks di dalam run tanpa menghapus
+    # formatting Word seperti underline, bold, font, dll.
+    # ========================================================
+
+    def replace_in_runs(paragraph, old, new):
+        changed = False
+
+        for run in paragraph.runs:
+            if old in run.text:
+                run.text = run.text.replace(old, new)
+                changed = True
+
+        return changed
+
+    # ========================================================
+    # Semua paragraph termasuk paragraph dalam tabel
+    # ========================================================
+
+    def all_paragraphs():
+        for paragraph in doc.paragraphs:
+            yield paragraph
+
+        for table in doc.tables:
+            for row in table.rows:
+                for cell in row.cells:
+                    for paragraph in cell.paragraphs:
+                        yield paragraph
+
+    # ========================================================
+    # 1. UNIT / RUANGAN
+    # ========================================================
+
+    for paragraph in all_paragraphs():
+        replace_in_runs(
+            paragraph,
+            "REKAM MEDIS",
+            unit_kerja,
+        )
+
+    # ========================================================
+    # 2. NAMA DAN NIP PADA BAGIAN HEADER
+    #
+    # Nama dan NIP di bagian:
+    # "Nama dan NIP : ..."
+    # harus mengikuti pegawai yang dipilih.
+    # ========================================================
+
+    for paragraph in doc.paragraphs:
+        if "Nama dan NIP" in paragraph.text:
+            replace_in_runs(
+                paragraph,
+                "Hariyadi Adha, S.Pd",
+                nama,
+            )
+
+            replace_in_runs(
+                paragraph,
+                "07012102016113030",
+                nip,
+            )
+
+    # ========================================================
+    # 3. TANGGAL PEMBUATAN SURAT
+    #
+    # Template:
+    # Mengetahui, Barabai, 28 Maret 2026
+    #
+    # Menjadi:
+    # Mengetahui, Barabai, [tanggal surat]
+    # ========================================================
+
+    for paragraph in doc.paragraphs:
+        if "Mengetahui" in paragraph.text and "Barabai" in paragraph.text:
+
+            old_text = paragraph.text
+
+            import re
+
+            new_text = re.sub(
+                r"(Barabai,\s*)"
+                r"\d{1,2}\s+"
+                r"(?:Januari|Februari|Maret|April|Mei|Juni|"
+                r"Juli|Agustus|September|Oktober|November|Desember)"
+                r"\s+\d{4}",
+                r"\1" + tanggal_surat,
+                old_text,
+            )
+
+            if new_text != old_text:
+
+                # Jika tanggal berada dalam satu run, pertahankan
+                # formatting run tersebut.
+                replaced = False
+
+                for run in paragraph.runs:
+                    if "Barabai," in run.text:
+                        run.text = re.sub(
+                            r"(Barabai,\s*)"
+                            r"\d{1,2}\s+"
+                            r"(?:Januari|Februari|Maret|April|Mei|Juni|"
+                            r"Juli|Agustus|September|Oktober|November|Desember)"
+                            r"\s+\d{4}",
+                            r"\1" + tanggal_surat,
+                            run.text,
+                        )
+                        replaced = True
+
+                # Fallback apabila teks terpecah di beberapa run.
+                if not replaced or paragraph.text != new_text:
+                    if paragraph.text != new_text:
+                        paragraph.clear()
+                        paragraph.add_run(new_text)
+
+    # ========================================================
+    # 4. TANDA TANGAN KANAN
+    #
+    # Kiri:
+    # Hj.Siti Salasiah, S.Kep. Ns
+    # NIP. 197307171998032008
+    #
+    # Kanan:
+    # nama pegawai terpilih
+    # NIPK. NIP pegawai terpilih
+    # ========================================================
+
+    for paragraph in doc.paragraphs:
+
+        # Nama kanan.
+        if (
+            "Hj.Siti Salasiah" in paragraph.text
+            and "Hariyadi Adha, S.Pd" in paragraph.text
+        ):
+            replace_in_runs(
+                paragraph,
+                "Hariyadi Adha, S.Pd",
+                nama,
+            )
+
+        # NIP kanan.
+        if (
+            "NIP. 197307171998032008" in paragraph.text
+            and "NIPK. 07012102016113030" in paragraph.text
+        ):
+            replace_in_runs(
+                paragraph,
+                "07012102016113030",
+                nip,
+            )
+
+    # ========================================================
+    # 5. CARI TABEL DATA LEMBUR
+    # ========================================================
+
+    required_headers = {
+        "no",
+        "hari/tanggal",
+        "jam mulai lembur",
+        "jam selesai lembur",
+        "jumlah jam lembur",
+        "laporan lembur",
+    }
+
+    target_table = None
+    header_row_index = None
+
+    for table in doc.tables:
+
+        for row_index, row in enumerate(table.rows):
+
+            texts = [
+                " ".join(cell.text.split()).lower()
+                for cell in row.cells
+            ]
+
+            found = 0
+
+            for header in required_headers:
+                if any(header in text for text in texts):
+                    found += 1
+
+            if found >= 4:
+                target_table = table
+                header_row_index = row_index
+                break
+
+        if target_table is not None:
+            break
+
+    if target_table is None:
+        raise ValueError(
+            "Tabel data lembur tidak ditemukan."
+        )
+
+    # ========================================================
+    # 6. PASTIKAN HANYA ADA SATU TABEL DATA
+    #
+    # Template mempunyai:
+    #   Tabel 1 -> nomor 1-6
+    #   Tabel 2 -> nomor 7
+    #
+    # Kita gunakan tabel pertama sebagai tabel final.
+    # ========================================================
+
+    # Cari baris data pertama pada tabel utama.
+    data_row_index = None
+
+    for index in range(
+        header_row_index + 1,
+        len(target_table.rows),
+    ):
+        first_cell = target_table.rows[index].cells[0].text.strip()
+
+        if first_cell.isdigit():
+            data_row_index = index
+            break
+
+    if data_row_index is None:
+        raise ValueError(
+            "Baris data lembur pada tabel utama tidak ditemukan."
+        )
+
+    # ========================================================
+    # 7. HAPUS SEMUA BARIS CONTOH DARI TABEL UTAMA
+    # ========================================================
+
+    def remove_row(row):
+        tr = row._tr
+        tr.getparent().remove(tr)
+
+    while len(target_table.rows) > data_row_index + 1:
+        remove_row(
+            target_table.rows[data_row_index + 1]
+        )
+
+    # ========================================================
+    # 8. HAPUS TABEL KEDUA YANG BERISI NOMOR 7
+    # ========================================================
+
+    tables_to_remove = []
+
+    for table in doc.tables:
+
+        if table is target_table:
+            continue
+
+        # Hapus tabel yang mempunyai data bernomor,
+        # khususnya tabel lanjutan nomor 7.
+        table_text = " ".join(
+            cell.text.strip()
+            for row in table.rows
+            for cell in row.cells
+        )
+
+        if (
+            "7" in table_text
+            or "Selasa" in table_text
+            or "24 Maret 2026" in table_text
+        ):
+            tables_to_remove.append(table)
+
+    for table in tables_to_remove:
+        tbl = table._tbl
+        tbl.getparent().remove(tbl)
+
+    # ========================================================
+    # 9. ISI SATU BARIS LEMBUR
+    # ========================================================
+
+    row = target_table.rows[data_row_index]
+    cells = row.cells
+
+    if len(cells) < 6:
+        raise ValueError(
+            "Jumlah kolom tabel lembur tidak sesuai."
+        )
+
+    cells[0].text = "1"
+    cells[1].text = tanggal
+    cells[2].text = jam_mulai
+    cells[3].text = jam_selesai
+    cells[4].text = total
+    cells[5].text = laporan
+
+    # ========================================================
+    # 10. HAPUS SPASI/TAB BERLEBIHAN PADA JUDUL TANDA TANGAN
+    #
+    # Tidak mengubah nama atau underline.
+    # ========================================================
+
+    for paragraph in doc.paragraphs:
+
+        if "Pelaksana Teknis Kegiatan" in paragraph.text:
+
+            for run in paragraph.runs:
+
+                run.text = run.text.replace(
+                    "\t\t\t\t\t\t",
+                    "\t\t",
+                )
+
+                run.text = run.text.replace(
+                    "                      ",
+                    "    ",
+                )
+
+    return doc
+
+def render_template(
+    template_name,
+    output_name,
+    values
+):
+
+    template = TEMPLATE_DIR / template_name
+
+    if not template.exists():
+
+        raise FileNotFoundError(
+            f"Template tidak ditemukan:\n{template}"
+        )
+
+    WORD_DIR.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    output = WORD_DIR / output_name
+
+    doc = Document(template)
+
+    # ========================================================
+    # TEMPLATE LEMBUR
+    # ========================================================
+
+    if template_name.lower() == (
+        "daftar hadir kerja lembur.docx"
+    ):
+
+        _replace_lembur_template(
+            doc,
+            values
+        )
+
+    else:
+
+        _replace_everywhere(
+            doc,
+            values
+        )
+
+    doc.save(output)
+
+    return output
+
+
+def find_soffice():
+
+    possible_paths = [
+
+        Path(
+            r"C:\Program Files\LibreOffice\program\soffice.exe"
+        ),
+
+        Path(
+            r"C:\Program Files (x86)\LibreOffice\program\soffice.exe"
+        ),
+
+    ]
+
+    for path in possible_paths:
+
+        if path.exists():
+
+            return path
+
+    return None
+
+
+def create_pdf_from_docx(docx_path):
+
+    docx_path = Path(docx_path)
+
+    if not docx_path.exists():
+
+        return None
+
+    soffice = find_soffice()
+
+    if soffice is None:
+
+        return None
+
+    PDF_DIR.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    pdf_path = (
+        PDF_DIR /
+        f"{docx_path.stem}.pdf"
+    )
+
+    try:
+
+        subprocess.run(
+            [
+                str(soffice),
+                "--headless",
+                "--convert-to",
+                "pdf",
+                "--outdir",
+                str(PDF_DIR),
+                str(docx_path)
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120
+        )
+
+        if pdf_path.exists():
+
+            return pdf_path
+
+        return None
+
+    except Exception:
+
+        return None
+
+
+def today_id():
+
+    return datetime.now().strftime(
+        "%Y%m%d_%H%M%S"
+    )

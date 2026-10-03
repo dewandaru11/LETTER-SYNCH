@@ -1,0 +1,3376 @@
+from pathlib import Path
+import os
+import sys
+import sqlite3
+import traceback
+from datetime import datetime, date, timedelta
+
+from PySide6.QtCore import Qt, QObject, QThread, Signal, QTime, QDate, QUrl
+from PySide6.QtGui import QDesktopServices
+from PySide6.QtWidgets import (
+    QApplication,
+    QMainWindow,
+    QWidget,
+    QVBoxLayout,
+    QHBoxLayout,
+    QFormLayout,
+    QGridLayout,
+    QLabel,
+    QPushButton,
+    QLineEdit,
+    QComboBox,
+    QDateEdit, QTimeEdit,
+    QSpinBox,
+    QTabWidget,
+    QTableWidget,
+    QTableWidgetItem,
+    QMessageBox,
+    QProgressDialog,
+    QGroupBox,
+    QFileDialog,
+    QHeaderView,
+    QTextEdit,
+    QFrame,
+)
+
+from app.database import get_connection, init_db
+from app.generator import render_template, create_pdf_from_docx
+
+
+# ============================================================
+# PATH
+# ============================================================
+
+BASE_DIR = Path(__file__).resolve().parent
+OUTPUT_DIR = BASE_DIR / "output"
+WORD_DIR = OUTPUT_DIR / "word"
+PDF_DIR = OUTPUT_DIR / "pdf"
+TEMPLATE_DIR = BASE_DIR / "templates"
+
+WORD_DIR.mkdir(parents=True, exist_ok=True)
+PDF_DIR.mkdir(parents=True, exist_ok=True)
+
+BULAN_ID = [
+    "Januari",
+    "Februari",
+    "Maret",
+    "April",
+    "Mei",
+    "Juni",
+    "Juli",
+    "Agustus",
+    "September",
+    "Oktober",
+    "November",
+    "Desember",
+]
+
+HARI_ID = [
+    "Senin",
+    "Selasa",
+    "Rabu",
+    "Kamis",
+    "Jumat",
+    "Sabtu",
+    "Minggu",
+]
+
+
+# ============================================================
+# DATABASE
+# ============================================================
+
+def ensure_archive_columns():
+    conn = get_connection()
+    cur = conn.cursor()
+
+    cur.execute("PRAGMA table_info(surat)")
+    columns = {row[1] for row in cur.fetchall()}
+
+    if "pdf_path" not in columns:
+        cur.execute("ALTER TABLE surat ADD COLUMN pdf_path TEXT")
+
+    if "created_at" not in columns:
+        cur.execute("ALTER TABLE surat ADD COLUMN created_at TEXT")
+
+    conn.commit()
+    conn.close()
+
+
+# ============================================================
+# FORMAT TANGGAL
+# ============================================================
+
+def parse_date(value):
+    if isinstance(value, date):
+        return value
+
+    if not value:
+        return date.today()
+
+    value = str(value).strip()
+
+    for fmt in ("%d-%m-%Y", "%d/%m/%Y", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(value, fmt).date()
+        except ValueError:
+            pass
+
+    raise ValueError(f"Format tanggal tidak dikenali: {value}")
+
+
+def format_date_id(value):
+    d = parse_date(value)
+    return f"{d.day} {BULAN_ID[d.month - 1]} {d.year}"
+
+
+def format_day_id(value):
+    d = parse_date(value)
+    return HARI_ID[d.weekday()]
+
+
+def format_range_day(start, end):
+    start = parse_date(start)
+    end = parse_date(end)
+
+    if start == end:
+        return HARI_ID[start.weekday()]
+
+    return f"{HARI_ID[start.weekday()]} s.d {HARI_ID[end.weekday()]}"
+
+
+def format_range_date(start, end):
+    start = parse_date(start)
+    end = parse_date(end)
+
+    if start == end:
+        return format_date_id(start)
+
+    return f"{format_date_id(start)} s.d {format_date_id(end)}"
+
+
+def count_workdays(start, end):
+    start = parse_date(start)
+    end = parse_date(end)
+
+    if end < start:
+        start, end = end, start
+
+    total = 0
+    current = start
+
+    while current <= end:
+        if current.weekday() < 5:
+            total += 1
+        current += timedelta(days=1)
+
+    return total
+
+
+# ============================================================
+# BACKGROUND WORKER
+# ============================================================
+
+class LetterWorker(QObject):
+    finished = Signal(object)
+    error = Signal(str)
+
+    def __init__(self, callback):
+        super().__init__()
+        self.callback = callback
+
+    def run(self):
+        try:
+            result = self.callback()
+            self.finished.emit(result)
+        except Exception:
+            error_text = traceback.format_exc()
+            print(error_text)
+            self.error.emit(error_text)
+
+
+# ============================================================
+# MAIN WINDOW
+# ============================================================
+
+
+class DashboardIcon(QWidget):
+    def __init__(self, icon_type, parent=None):
+        super().__init__(parent)
+        self.icon_type = icon_type
+        self.setFixedSize(58, 58)
+
+    def paintEvent(self, event):
+        from PySide6.QtGui import QPainter, QPen, QBrush
+        from PySide6.QtCore import Qt, QRectF
+
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        # Lingkaran dasar
+        painter.setPen(QPen(Qt.GlobalColor.darkGray, 2))
+        painter.setBrush(QBrush(Qt.GlobalColor.white))
+        painter.drawEllipse(QRectF(3, 3, 52, 52))
+
+        pen = QPen(Qt.GlobalColor.darkGray, 2.5)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+
+        cx = 29
+
+        if self.icon_type == "pegawai":
+            painter.drawEllipse(QRectF(22, 12, 14, 14))
+            painter.drawArc(QRectF(14, 27, 30, 24), 0, 180 * 16)
+
+        elif self.icon_type == "izin":
+            painter.drawRect(QRectF(17, 11, 24, 34))
+            painter.drawLine(22, 19, 36, 19)
+            painter.drawLine(22, 25, 36, 25)
+            painter.drawLine(22, 31, 32, 31)
+            painter.drawLine(30, 39, 42, 27)
+
+        elif self.icon_type == "sakit":
+            painter.drawRect(QRectF(18, 11, 22, 36))
+            painter.drawLine(cx, 19, cx, 39)
+            painter.drawLine(19, 29, 39, 29)
+
+        elif self.icon_type == "cuti":
+            painter.drawRoundedRect(QRectF(13, 16, 32, 30), 4, 4)
+            painter.drawLine(13, 24, 45, 24)
+            painter.drawLine(21, 11, 21, 20)
+            painter.drawLine(37, 11, 37, 20)
+            painter.drawLine(21, 31, 25, 35)
+            painter.drawLine(25, 35, 34, 28)
+
+        elif self.icon_type == "lembur":
+            painter.drawEllipse(QRectF(14, 12, 30, 30))
+            painter.drawLine(cx, 18, cx, 28)
+            painter.drawLine(cx, 28, 35, 33)
+
+        elif self.icon_type == "arsip":
+            painter.drawRoundedRect(QRectF(12, 17, 34, 27), 3, 3)
+            painter.drawLine(12, 22, 46, 22)
+            painter.drawLine(20, 17, 25, 12)
+            painter.drawLine(25, 12, 36, 12)
+            painter.drawLine(36, 12, 40, 17)
+
+        painter.end()
+
+
+class MainWindow(QMainWindow):
+
+    def __init__(self):
+        super().__init__()
+
+        self.setWindowTitle("LetterSync - Sistem Surat Menyurat")
+        self.resize(1200, 750)
+
+        self.thread = None
+        self.worker = None
+        self.progress = None
+
+        self.apply_theme()
+        self.ensure_lembur_table()
+        self.setup_ui()
+        self.load_employees()
+        self.load_archive()
+
+    # ========================================================
+    # UI
+    # ========================================================
+
+    def apply_theme(self):
+
+        self.setStyleSheet("""
+            QMainWindow {
+                background: #f4f7f9;
+            }
+
+            QWidget {
+                font-family: "Segoe UI";
+                font-size: 10pt;
+                color: #24313a;
+            }
+
+            QTabWidget::pane {
+                border: 1px solid #d9e2e7;
+                background: #ffffff;
+                border-radius: 10px;
+                margin-top: 4px;
+            }
+
+            QTabBar::tab {
+                background: #e8eef2;
+                color: #40515c;
+                padding: 11px 20px;
+                margin-right: 3px;
+                border-top-left-radius: 8px;
+                border-top-right-radius: 8px;
+                min-width: 95px;
+            }
+
+            QTabBar::tab:selected {
+                background: #0f6b78;
+                color: white;
+                font-weight: bold;
+            }
+
+            QTabBar::tab:hover {
+                background: #d7e6e9;
+            }
+
+            QGroupBox {
+                background: white;
+                border: 1px solid #d9e2e7;
+                border-radius: 12px;
+                margin-top: 14px;
+                padding: 18px 12px 12px 12px;
+                font-weight: bold;
+                color: #0f5964;
+            }
+
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 15px;
+                padding: 0 8px;
+                background: white;
+            }
+
+            QLineEdit,
+            QTextEdit,
+            QComboBox {
+                background: #ffffff;
+                border: 1px solid #cbd8de;
+                border-radius: 7px;
+                padding: 8px;
+                min-height: 20px;
+            }
+
+            QLineEdit:focus,
+            QTextEdit:focus,
+            QComboBox:focus {
+                border: 2px solid #2993a1;
+            }
+
+            QPushButton {
+                background: #0f6b78;
+                color: white;
+                border: none;
+                border-radius: 7px;
+                padding: 9px 16px;
+                font-weight: 600;
+                min-height: 18px;
+            }
+
+            QPushButton:hover {
+                background: #148392;
+            }
+
+            QPushButton:pressed {
+                background: #0a5661;
+            }
+
+            QPushButton:disabled {
+                background: #aebdc2;
+                color: #eef2f3;
+            }
+
+            QTableWidget {
+                background: white;
+                border: 1px solid #d9e2e7;
+                border-radius: 8px;
+                gridline-color: #e4ebee;
+                selection-background-color: #d7edef;
+                selection-color: #17323a;
+            }
+
+            QHeaderView::section {
+                background: #e9f0f2;
+                color: #31505a;
+                padding: 9px;
+                border: none;
+                border-bottom: 1px solid #ccd9de;
+                font-weight: bold;
+            }
+
+            QStatusBar {
+                background: #0d3f48;
+                color: white;
+                padding: 4px 10px;
+            }
+
+            QProgressDialog {
+                background: white;
+            }
+
+            QMessageBox {
+                background: white;
+            }
+        """)
+
+
+    def ensure_lembur_table(self):
+        """Membuat tabel lembur jika belum tersedia."""
+        conn = get_connection()
+        cur = conn.cursor()
+
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS lembur (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                pegawai_id INTEGER,
+                tanggal TEXT NOT NULL,
+                jam_mulai TEXT,
+                jam_selesai TEXT,
+                rentang_jam TEXT,
+                total_jam TEXT,
+                laporan_lembur TEXT DEFAULT '',
+                status TEXT DEFAULT 'Draft',
+                file_path TEXT,
+                pdf_path TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(pegawai_id) REFERENCES pegawai(id)
+            )
+        """)
+
+        conn.commit()
+        conn.close()
+
+    def setup_ui(self):
+
+        central = QWidget()
+        self.setCentralWidget(central)
+
+        main_layout = QVBoxLayout(central)
+
+        title = QLabel("LetterSync")
+        title.setAlignment(Qt.AlignCenter)
+        title.setStyleSheet("""
+            QLabel {
+                font-size: 28px;
+                font-weight: bold;
+                padding: 10px;
+            }
+        """)
+        main_layout.addWidget(title)
+
+        subtitle = QLabel(
+            "Sistem Surat Menyurat - Pembuatan Surat Word dan PDF"
+        )
+        subtitle.setAlignment(Qt.AlignCenter)
+        subtitle.setStyleSheet("""
+            QLabel {
+                font-size: 14px;
+                color: #555;
+                padding-left: 12px;
+                padding-bottom: 10px;
+            }
+        """)
+        main_layout.addWidget(subtitle)
+
+        self.tabs = QTabWidget()
+        main_layout.addWidget(self.tabs)
+
+        self.create_dashboard_tab()
+        self.create_pegawai_tab()
+        self.create_izin_tab()
+        self.create_sakit_tab()
+        self.create_cuti_tab()
+        self.create_lembur_tab()
+        self.create_archive_tab()
+
+        # ====================================================
+        # FOOTER
+        # ====================================================
+
+        footer = QFrame()
+        footer.setStyleSheet("""
+            QFrame {
+                background: #0d3f48;
+                border-radius: 8px;
+                margin-top: 6px;
+            }
+        """)
+
+        footer_layout = QHBoxLayout(footer)
+        footer_layout.setContentsMargins(14, 7, 14, 7)
+
+        footer_label = QLabel(
+            'BK Tech · Support Adha H.Y '
+            '<a href="https://saweria.co/simpatik" '
+            'style="color:#7ee5ed; font-weight:bold;">'
+            'untuk Support & Developer</a>'
+        )
+
+        footer_label.setOpenExternalLinks(True)
+        footer_label.setAlignment(Qt.AlignCenter)
+        footer_label.setStyleSheet("""
+            QLabel {
+                color: #e8f5f7;
+                font-size: 9pt;
+            }
+            QLabel a {
+                color: #7ee5ed;
+            }
+        """)
+
+        footer_layout.addWidget(footer_label)
+
+        main_layout.addWidget(footer)
+
+        self.statusBar().showMessage("LetterSync siap digunakan.")
+
+    # ========================================================
+    # DASHBOARD
+    # ========================================================
+
+    def create_dashboard_tab(self):
+        tab = QWidget()
+
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(30, 25, 30, 25)
+        layout.setSpacing(18)
+
+        # ====================================================
+        # HEADER DASHBOARD
+        # ====================================================
+
+        title = QLabel("LetterSync")
+        title.setAlignment(Qt.AlignCenter)
+        title.setStyleSheet("""
+            QLabel {
+                font-size: 30px;
+                font-weight: bold;
+                padding: 5px;
+            }
+        """)
+        layout.addWidget(title)
+
+        subtitle = QLabel("Sistem Surat Menyurat")
+        subtitle.setAlignment(Qt.AlignCenter)
+        subtitle.setStyleSheet("""
+            QLabel {
+                font-size: 17px;
+                color: #666666;
+                padding-bottom: 10px;
+            }
+        """)
+        layout.addWidget(subtitle)
+
+        welcome = QLabel("Selamat Datang")
+        welcome.setAlignment(Qt.AlignCenter)
+        welcome.setStyleSheet("""
+            QLabel {
+                font-size: 22px;
+                font-weight: bold;
+                padding: 8px;
+            }
+        """)
+        layout.addWidget(welcome)
+
+        info = QLabel(
+            "Kelola data pegawai, surat menyurat, lembur, "
+            "dan arsip dokumen dalam satu aplikasi."
+        )
+        info.setAlignment(Qt.AlignCenter)
+        info.setStyleSheet("""
+            QLabel {
+                font-size: 14px;
+                color: #777777;
+                padding-bottom: 12px;
+            }
+        """)
+        layout.addWidget(info)
+
+        # ====================================================
+        # STATISTIK
+        # ====================================================
+
+        stats_layout = QGridLayout()
+        stats_layout.setHorizontalSpacing(15)
+        stats_layout.setVerticalSpacing(15)
+
+        self.dashboard_cards = {}
+
+        cards = [
+            ("pegawai", "?", "TOTAL PEGAWAI"),
+            ("izin", "?", "SURAT IZIN"),
+            ("sakit", "?", "SURAT SAKIT"),
+            ("cuti", "?", "SURAT CUTI"),
+            ("lembur", "?", "LEMBUR"),
+            ("arsip", "?", "TOTAL ARSIP"),
+        ]
+
+        for index, (key, icon, label) in enumerate(cards):
+            card = QFrame()
+            card.setFrameShape(QFrame.StyledPanel)
+            card.setStyleSheet("""
+                QFrame {
+                    background: white;
+                    border: 1px solid #dddddd;
+                    border-radius: 12px;
+                }
+            """)
+
+            card_layout = QVBoxLayout(card)
+            card_layout.setContentsMargins(15, 15, 15, 15)
+            card_layout.setSpacing(5)
+
+            icon_label = QLabel(icon)
+            icon_label.setAlignment(Qt.AlignCenter)
+            icon_label.setFixedSize(52, 52)
+            icon_label.setAlignment(Qt.AlignCenter)
+            icon_label.setStyleSheet("""
+                QLabel {
+                    font-size: 22px;
+                    font-weight: bold;
+                    border: 2px solid #888888;
+                    border-radius: 26px;
+                    background: transparent;
+                }
+            """)
+
+            label_widget = QLabel(label)
+            label_widget.setAlignment(Qt.AlignCenter)
+            label_widget.setStyleSheet("""
+                QLabel {
+                    font-size: 12px;
+                    font-weight: bold;
+                    color: #666666;
+                    border: none;
+                    background: transparent;
+                }
+            """)
+
+            value_widget = QLabel("0")
+            value_widget.setAlignment(Qt.AlignCenter)
+            value_widget.setStyleSheet("""
+                QLabel {
+                    font-size: 28px;
+                    font-weight: bold;
+                    border: none;
+                    background: transparent;
+                }
+            """)
+
+            card_layout.addWidget(icon_label)
+            card_layout.addWidget(label_widget)
+            card_layout.addWidget(value_widget)
+
+            row = index // 3
+            column = index % 3
+            stats_layout.addWidget(card, row, column)
+
+            self.dashboard_cards[key] = value_widget
+
+        layout.addLayout(stats_layout)
+
+        # ====================================================
+        # TOMBOL REFRESH
+        # ====================================================
+
+        refresh_button = QPushButton("??  Refresh Statistik")
+        refresh_button.setMinimumHeight(40)
+        refresh_button.clicked.connect(self.refresh_dashboard)
+
+        button_layout = QHBoxLayout()
+        button_layout.addStretch()
+        button_layout.addWidget(refresh_button)
+        button_layout.addStretch()
+
+        layout.addLayout(button_layout)
+
+        layout.addStretch()
+
+        self.tabs.addTab(tab, "Dashboard")
+
+        # Load statistik saat Dashboard dibuat
+        self.refresh_dashboard()
+
+    def refresh_dashboard(self):
+        try:
+            conn = get_connection()
+            cur = conn.cursor()
+
+            # Total pegawai
+            cur.execute("SELECT COUNT(*) FROM pegawai")
+            total_pegawai = cur.fetchone()[0]
+
+            # Surat berdasarkan jenis
+            cur.execute("""
+                SELECT jenis, COUNT(*)
+                FROM surat
+                GROUP BY jenis
+            """)
+
+            surat_counts = {}
+
+            for row in cur.fetchall():
+                jenis = str(row[0] or "").strip().lower()
+                surat_counts[jenis] = row[1]
+
+            # Total lembur
+            cur.execute("SELECT COUNT(*) FROM lembur")
+            total_lembur = cur.fetchone()[0]
+
+            # Total arsip
+            cur.execute("SELECT COUNT(*) FROM surat")
+            total_surat = cur.fetchone()[0]
+
+            conn.close()
+
+            self.dashboard_cards["pegawai"].setText(
+                str(total_pegawai)
+            )
+
+            self.dashboard_cards["izin"].setText(
+                str(surat_counts.get("izin", 0))
+            )
+
+            self.dashboard_cards["sakit"].setText(
+                str(surat_counts.get("sakit", 0))
+            )
+
+            self.dashboard_cards["cuti"].setText(
+                str(surat_counts.get("cuti", 0))
+            )
+
+            self.dashboard_cards["lembur"].setText(
+                str(total_lembur)
+            )
+
+            self.dashboard_cards["arsip"].setText(
+                str(total_surat + total_lembur)
+            )
+
+        except Exception as e:
+            print("Gagal memuat statistik dashboard:", e)
+
+
+    # ========================================================
+    # PEGAWAI
+    # ========================================================
+
+    def create_pegawai_tab(self):
+
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+
+        form_box = QGroupBox("Data Pegawai")
+        form = QFormLayout(form_box)
+
+        self.p_nama = QLineEdit()
+        self.p_nip = QLineEdit()
+        self.p_jabatan = QLineEdit()
+        self.p_unit = QLineEdit()
+        self.p_masa = QLineEdit()
+        self.p_telepon = QLineEdit()
+        self.p_alamat = QTextEdit()
+
+        form.addRow("Nama:", self.p_nama)
+        form.addRow("NIP:", self.p_nip)
+        form.addRow("Jabatan:", self.p_jabatan)
+        form.addRow("Unit Kerja:", self.p_unit)
+        form.addRow("Masa Kerja:", self.p_masa)
+        form.addRow("Telepon:", self.p_telepon)
+        form.addRow("Alamat:", self.p_alamat)
+
+        layout.addWidget(form_box)
+
+        buttons = QHBoxLayout()
+
+        btn_save = QPushButton("Simpan Pegawai")
+        btn_save.clicked.connect(self.save_employee)
+
+        btn_refresh = QPushButton("Refresh")
+        btn_refresh.clicked.connect(self.load_employees)
+
+        btn_delete = QPushButton("?? Hapus Pegawai")
+        btn_delete.clicked.connect(self.delete_employee)
+
+        buttons.addWidget(btn_save)
+        buttons.addWidget(btn_refresh)
+        buttons.addWidget(btn_delete)
+        buttons.addStretch()
+
+        layout.addLayout(buttons)
+
+        self.employee_table = QTableWidget()
+        self.employee_table.setColumnCount(7)
+        self.employee_table.setHorizontalHeaderLabels([
+            "ID",
+            "Nama",
+            "NIP",
+            "Jabatan",
+            "Unit Kerja",
+            "Masa Kerja",
+            "Telepon",
+        ])
+
+        self.employee_table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.Stretch
+        )
+
+        layout.addWidget(self.employee_table)
+
+        self.tabs.addTab(tab, "Pegawai")
+
+    # ========================================================
+    # LOAD PEGAWAI
+    # ========================================================
+
+    def load_employees(self):
+
+        conn = get_connection()
+        cur = conn.cursor()
+
+        cur.execute("""
+            SELECT id, nama, nip, jabatan, unit_kerja, masa_kerja, telepon, alamat
+            FROM pegawai
+            ORDER BY nama
+        """)
+
+        self.employees = [dict(row) for row in cur.fetchall()]
+
+        conn.close()
+
+        if hasattr(self, "employee_table"):
+            self.employee_table.setRowCount(len(self.employees))
+
+            for r, emp in enumerate(self.employees):
+                values = [
+                    emp.get("id", ""),
+                    emp.get("nama", ""),
+                    emp.get("nip", ""),
+                    emp.get("jabatan", ""),
+                    emp.get("unit_kerja", ""),
+                    emp.get("masa_kerja", ""),
+                    emp.get("telepon", ""),
+                ]
+
+                for c, value in enumerate(values):
+                    self.employee_table.setItem(
+                        r,
+                        c,
+                        QTableWidgetItem(str(value or ""))
+                    )
+
+        for combo_name in (
+            "i_pegawai",
+            "s_pegawai",
+            "c_pegawai",
+        ):
+            if hasattr(self, combo_name):
+                self.populate_employee_combo(getattr(self, combo_name))
+
+    # ========================================================
+    # POPULATE COMBO PEGAWAI
+    # ========================================================
+
+    def populate_employee_combo(self, combo):
+
+        current_id = combo.currentData()
+
+        combo.blockSignals(True)
+        combo.clear()
+
+        combo.addItem("-- Pilih Pegawai --", None)
+
+        for emp in self.employees:
+            text = emp.get("nama", "")
+
+            if emp.get("nip"):
+                text += f" - {emp['nip']}"
+
+            combo.addItem(text, emp.get("id"))
+
+        if current_id is not None:
+            index = combo.findData(current_id)
+
+            if index >= 0:
+                combo.setCurrentIndex(index)
+
+        combo.blockSignals(False)
+
+    # ========================================================
+    # SAVE PEGAWAI
+    # ========================================================
+
+    def save_employee(self):
+
+        nama = self.p_nama.text().strip()
+
+        if not nama:
+            QMessageBox.warning(
+                self,
+                "Data Belum Lengkap",
+                "Nama pegawai wajib diisi."
+            )
+            return
+
+        conn = get_connection()
+        cur = conn.cursor()
+
+        cur.execute("""
+            INSERT INTO pegawai
+            (nama, nip, jabatan, unit_kerja, masa_kerja, telepon, alamat)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (
+            nama,
+            self.p_nip.text().strip(),
+            self.p_jabatan.text().strip(),
+            self.p_unit.text().strip(),
+            self.p_masa.text().strip(),
+            self.p_telepon.text().strip(),
+            self.p_alamat.toPlainText().strip(),
+        ))
+
+        conn.commit()
+        conn.close()
+
+        self.p_nama.clear()
+        self.p_nip.clear()
+        self.p_jabatan.clear()
+        self.p_unit.clear()
+        self.p_masa.clear()
+        self.p_telepon.clear()
+        self.p_alamat.clear()
+
+        self.load_employees()
+
+        QMessageBox.information(
+            self,
+            "Berhasil",
+            "Data pegawai berhasil disimpan."
+        )
+
+    # ========================================================
+    # HAPUS PEGAWAI
+    # ========================================================
+
+    def delete_employee(self):
+
+        row = self.employee_table.currentRow()
+
+        if row < 0:
+            QMessageBox.warning(
+                self,
+                "Pilih Pegawai",
+                "Silakan pilih baris pegawai yang ingin dihapus."
+            )
+            return
+
+        id_item = self.employee_table.item(row, 0)
+        nama_item = self.employee_table.item(row, 1)
+
+        if not id_item:
+            QMessageBox.warning(
+                self,
+                "Data Tidak Valid",
+                "Data pegawai tidak dapat dibaca."
+            )
+            return
+
+        employee_id = int(id_item.text())
+        nama = nama_item.text() if nama_item else ""
+
+        conn = get_connection()
+
+        try:
+            cur = conn.cursor()
+
+            cur.execute(
+                "SELECT COUNT(*) FROM surat WHERE pegawai_id = ?",
+                (employee_id,)
+            )
+
+            jumlah_surat = cur.fetchone()[0]
+
+        finally:
+            conn.close()
+
+        if jumlah_surat > 0:
+            QMessageBox.warning(
+                self,
+                "Tidak Dapat Dihapus",
+                f"Pegawai '{nama}' sudah digunakan dalam "
+                f"{jumlah_surat} surat.\n\n"
+                "Data tidak dihapus agar arsip surat tetap aman."
+            )
+            return
+
+        jawaban = QMessageBox.question(
+            self,
+            "Konfirmasi Hapus Pegawai",
+            f"Yakin ingin menghapus pegawai berikut?\n\n"
+            f"{nama}\n\n"
+            "Data yang sudah dihapus tidak dapat dikembalikan.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+
+        if jawaban != QMessageBox.Yes:
+            return
+
+        try:
+            conn = get_connection()
+            cur = conn.cursor()
+
+            cur.execute(
+                "DELETE FROM pegawai WHERE id = ?",
+                (employee_id,)
+            )
+
+            conn.commit()
+
+        except Exception as e:
+
+            QMessageBox.critical(
+                self,
+                "Gagal Menghapus",
+                f"Data pegawai tidak dapat dihapus.\n\n{e}"
+            )
+
+            return
+
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+        self.load_employees()
+
+        QMessageBox.information(
+            self,
+            "Berhasil",
+            f"Data pegawai '{nama}' berhasil dihapus."
+        )
+
+        self.statusBar().showMessage(
+            "Data pegawai berhasil dihapus.",
+            5000
+        )
+
+    # ========================================================
+    # SURAT IZIN
+    # ========================================================
+
+    def create_izin_tab(self):
+
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+
+        box = QGroupBox("Surat Izin")
+        form = QFormLayout(box)
+
+        self.i_pegawai = QComboBox()
+        self.i_tanggal = QLineEdit(
+            date.today().strftime("%d-%m-%Y")
+        )
+        self.i_keperluan = QTextEdit()
+
+        form.addRow("Pegawai:", self.i_pegawai)
+        form.addRow("Tanggal:", self.i_tanggal)
+        form.addRow("Keperluan:", self.i_keperluan)
+
+        layout.addWidget(box)
+
+        self.i_save_button = QPushButton(
+            "Simpan Surat Izin"
+        )
+        self.i_save_button.clicked.connect(
+            self.save_izin
+        )
+
+        layout.addWidget(self.i_save_button)
+        layout.addStretch()
+
+        self.tabs.addTab(tab, "Surat Izin")
+
+    def save_izin(self):
+
+        employee = self.get_selected_employee(
+            self.i_pegawai
+        )
+
+        if not employee:
+            QMessageBox.warning(
+                self,
+                "Data Belum Lengkap",
+                "Silakan pilih pegawai."
+            )
+            return
+
+        keperluan = self.i_keperluan.toPlainText().strip()
+
+        if not keperluan:
+            QMessageBox.warning(
+                self,
+                "Data Belum Lengkap",
+                "Keperluan wajib diisi."
+            )
+            return
+
+        try:
+            tanggal = parse_date(
+                self.i_tanggal.text()
+            )
+        except Exception:
+            QMessageBox.warning(
+                self,
+                "Tanggal Salah",
+                "Gunakan format tanggal DD-MM-YYYY."
+            )
+            return
+
+        values = {
+            "{{NAMA}}": employee.get("nama", ""),
+            "{{JABATAN}}": employee.get("jabatan", ""),
+            "{{HARI}}": format_day_id(tanggal),
+            "{{TANGGAL_SURAT}}": format_date_id(tanggal),
+            "{{KEPERLUAN}}": keperluan,
+        }
+
+        self.start_letter_worker(
+            "Surat Izin",
+            "surat_izin.docx",
+            employee,
+            tanggal,
+            values,
+        )
+
+    # ========================================================
+    # SURAT SAKIT
+    # ========================================================
+
+    def create_sakit_tab(self):
+
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+
+        box = QGroupBox("Surat Sakit")
+        form = QFormLayout(box)
+
+        self.s_pegawai = QComboBox()
+
+        self.s_mulai = QLineEdit(
+            date.today().strftime("%d-%m-%Y")
+        )
+
+        self.s_selesai = QLineEdit(
+            date.today().strftime("%d-%m-%Y")
+        )
+
+        self.s_keperluan = QTextEdit()
+
+        form.addRow("Pegawai:", self.s_pegawai)
+        form.addRow("Tanggal Mulai:", self.s_mulai)
+        form.addRow("Tanggal Selesai:", self.s_selesai)
+        form.addRow("Keperluan:", self.s_keperluan)
+
+        layout.addWidget(box)
+
+        self.s_save_button = QPushButton(
+            "Simpan Surat Sakit"
+        )
+        self.s_save_button.clicked.connect(
+            self.save_sakit
+        )
+
+        layout.addWidget(self.s_save_button)
+        layout.addStretch()
+
+        self.tabs.addTab(tab, "Surat Sakit")
+
+    def save_sakit(self):
+
+        employee = self.get_selected_employee(
+            self.s_pegawai
+        )
+
+        if not employee:
+            QMessageBox.warning(
+                self,
+                "Data Belum Lengkap",
+                "Silakan pilih pegawai."
+            )
+            return
+
+        keperluan = self.s_keperluan.toPlainText().strip()
+
+        if not keperluan:
+            QMessageBox.warning(
+                self,
+                "Data Belum Lengkap",
+                "Keperluan wajib diisi."
+            )
+            return
+
+        try:
+            mulai = parse_date(
+                self.s_mulai.text()
+            )
+
+            selesai = parse_date(
+                self.s_selesai.text()
+            )
+
+        except Exception:
+            QMessageBox.warning(
+                self,
+                "Tanggal Salah",
+                "Gunakan format DD-MM-YYYY."
+            )
+            return
+
+        if selesai < mulai:
+            QMessageBox.warning(
+                self,
+                "Tanggal Salah",
+                "Tanggal selesai tidak boleh sebelum tanggal mulai."
+            )
+            return
+
+        jumlah_hari = count_workdays(
+            mulai,
+            selesai
+        )
+
+        if jumlah_hari <= 0:
+            QMessageBox.warning(
+                self,
+                "Tanggal Tidak Valid",
+                "Rentang tanggal tersebut tidak memiliki hari kerja."
+            )
+            return
+
+        values = {
+            "Hariyadi Adha, S.Pd":
+                employee.get("nama", ""),
+
+            "07012102016113030":
+                employee.get("nip", ""),
+
+            "Petugas Loket BPJS":
+                employee.get("jabatan", ""),
+
+            "Kamis s.d Jumat":
+                format_range_day(mulai, selesai),
+
+            "16 Oktober 2025 s.d 17 Oktober 2025":
+                format_range_date(mulai, selesai),
+
+            "2 hari kerja":
+                f"{jumlah_hari} hari kerja",
+
+            "Menjaga Istri sakit":
+                keperluan,
+        }
+
+        self.start_letter_worker(
+            "Surat Sakit",
+            "surat_sakit.docx",
+            employee,
+            mulai,
+            values,
+        )
+
+    # ========================================================
+    # SURAT CUTI
+    # ========================================================
+
+    def create_cuti_tab(self):
+
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+
+        box = QGroupBox("Surat Cuti")
+        form = QFormLayout(box)
+
+        self.c_pegawai = QComboBox()
+
+        self.c_lama = QLineEdit()
+        self.c_alamat = QLineEdit()
+        self.c_alasan = QTextEdit()
+        self.c_masa = QLineEdit()
+        self.c_telepon = QLineEdit()
+        self.c_sisa_n1 = QLineEdit()
+        self.c_sisa_n2 = QLineEdit()
+
+        form.addRow("Pegawai:", self.c_pegawai)
+        form.addRow("Lama Cuti:", self.c_lama)
+        form.addRow("Alamat Cuti:", self.c_alamat)
+        form.addRow("Alasan Cuti:", self.c_alasan)
+        form.addRow("Masa Kerja:", self.c_masa)
+        form.addRow("Telepon:", self.c_telepon)
+        form.addRow("Sisa N1:", self.c_sisa_n1)
+        form.addRow("Sisa N2:", self.c_sisa_n2)
+
+        layout.addWidget(box)
+
+        self.c_save_button = QPushButton(
+            "Simpan Surat Cuti"
+        )
+
+        self.c_save_button.clicked.connect(
+            self.save_cuti
+        )
+
+        layout.addWidget(self.c_save_button)
+        layout.addStretch()
+
+        self.c_pegawai.currentIndexChanged.connect(
+            self.on_cuti_employee_changed
+        )
+
+        self.tabs.addTab(tab, "Surat Cuti")
+
+    def on_cuti_employee_changed(self):
+
+        employee = self.get_selected_employee(
+            self.c_pegawai
+        )
+
+        if not employee:
+            return
+
+        self.c_masa.setText(
+            employee.get("masa_kerja") or ""
+        )
+
+        self.c_telepon.setText(
+            employee.get("telepon") or ""
+        )
+
+        self.c_alamat.setText(
+            employee.get("alamat") or ""
+        )
+
+    def save_cuti(self):
+
+        employee = self.get_selected_employee(
+            self.c_pegawai
+        )
+
+        if not employee:
+            QMessageBox.warning(
+                self,
+                "Data Belum Lengkap",
+                "Silakan pilih pegawai."
+            )
+            return
+
+        values = {
+            "{{NAMA}}":
+                employee.get("nama", ""),
+
+            "{{NIP}}":
+                employee.get("nip", ""),
+
+            "{{ALAMAT_CUTI}}":
+                self.c_alamat.text().strip(),
+
+            "{{ALASAN_CUTI}}":
+                self.c_alasan.toPlainText().strip(),
+
+            "{{LAMA_CUTI}}":
+                self.c_lama.text().strip(),
+
+            "{{MASA_KERJA}}":
+                self.c_masa.text().strip(),
+
+            "{{TELEPON}}":
+                self.c_telepon.text().strip(),
+
+            "{{SISA_N1}}":
+                self.c_sisa_n1.text().strip(),
+
+            "{{SISA_N2}}":
+                self.c_sisa_n2.text().strip(),
+        }
+
+        self.start_letter_worker(
+            "Surat Cuti",
+            "surat_cuti.docx",
+            employee,
+            date.today(),
+            values,
+        )
+
+    # ========================================================
+    # GET EMPLOYEE
+    # ========================================================
+
+    def get_selected_employee(self, combo):
+
+        employee_id = combo.currentData()
+
+        if employee_id is None:
+            return None
+
+        for employee in self.employees:
+            if employee.get("id") == employee_id:
+                return dict(employee)
+
+        return None
+
+    # ========================================================
+    # BACKGROUND SAVE
+    # ========================================================
+
+    def start_letter_worker(
+        self,
+        jenis,
+        template_name,
+        employee,
+        tanggal,
+        values,
+    ):
+
+        # ----------------------------------------------------
+        # Buat nama file sebelum masuk thread
+        # ----------------------------------------------------
+
+        timestamp = datetime.now().strftime(
+            "%Y%m%d_%H%M%S"
+        )
+
+        safe_name = self.safe_filename(
+            employee.get("nama") or "pegawai"
+        )
+
+        output_name = (
+            f"{jenis.replace(' ', '_')}_"
+            f"{safe_name}_"
+            f"{timestamp}.docx"
+        )
+
+        # ----------------------------------------------------
+        # Disable semua tombol simpan
+        # ----------------------------------------------------
+
+        self.set_save_buttons_enabled(False)
+
+        # ----------------------------------------------------
+        # Indikator proses
+        # ----------------------------------------------------
+
+        self.progress = QProgressDialog(
+            "Sedang membuat surat...",
+            None,
+            0,
+            0,
+            self,
+        )
+
+        self.progress.setWindowTitle(
+            "LetterSync"
+        )
+
+        self.progress.setCancelButton(None)
+        self.progress.setMinimumDuration(0)
+        self.progress.setWindowModality(
+            Qt.WindowModal
+        )
+
+        self.progress.show()
+
+        self.statusBar().showMessage(
+            "Sedang membuat surat..."
+        )
+
+        QApplication.processEvents()
+
+        # ----------------------------------------------------
+        # Data untuk worker
+        # ----------------------------------------------------
+
+        def do_work():
+
+            # ================================================
+            # BUAT WORD
+            # ================================================
+
+            render_template(
+                template_name,
+                output_name,
+                values,
+            )
+
+            docx_path = WORD_DIR / output_name
+
+            if not docx_path.exists():
+                raise FileNotFoundError(
+                    f"File Word tidak ditemukan:\n{docx_path}"
+                )
+
+            # ================================================
+            # BUAT PDF
+            # ================================================
+
+            create_pdf_from_docx(
+                docx_path
+            )
+
+            pdf_path = (
+                PDF_DIR /
+                f"{docx_path.stem}.pdf"
+            )
+
+            if not pdf_path.exists():
+                raise FileNotFoundError(
+                    "PDF gagal dibuat.\n\n"
+                    "Pastikan LibreOffice tersedia."
+                )
+
+            # ================================================
+            # SIMPAN ARSIP
+            # ================================================
+
+            conn = get_connection()
+            cur = conn.cursor()
+
+            cur.execute("""
+                INSERT INTO surat
+                (
+                    jenis,
+                    nomor,
+                    pegawai_id,
+                    tanggal_surat,
+                    status,
+                    file_path,
+                    pdf_path,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                jenis,
+                "",
+                employee.get("id"),
+                tanggal.isoformat(),
+                "Selesai",
+                str(docx_path),
+                str(pdf_path),
+                datetime.now().isoformat(
+                    timespec="seconds"
+                ),
+            ))
+
+            conn.commit()
+
+            surat_id = cur.lastrowid
+
+            conn.close()
+
+            return {
+                "id": surat_id,
+                "jenis": jenis,
+                "employee": employee.get("nama", ""),
+                "word": str(docx_path),
+                "pdf": str(pdf_path),
+            }
+
+        # ----------------------------------------------------
+        # Thread
+        # ----------------------------------------------------
+
+        self.thread = QThread()
+        self.worker = LetterWorker(
+            do_work
+        )
+
+        self.worker.moveToThread(
+            self.thread
+        )
+
+        self.thread.started.connect(
+            self.worker.run
+        )
+
+        self.worker.finished.connect(
+            self.letter_finished
+        )
+
+        self.worker.error.connect(
+            self.letter_error
+        )
+
+        self.worker.finished.connect(
+            self.thread.quit
+        )
+
+        self.worker.error.connect(
+            self.thread.quit
+        )
+
+        self.thread.finished.connect(
+            self.worker.deleteLater
+        )
+
+        self.thread.finished.connect(
+            self.thread.deleteLater
+        )
+
+        self.thread.start()
+
+    # ========================================================
+    # THREAD SUCCESS
+    # ========================================================
+
+    def letter_finished(self, result):
+
+        if self.progress:
+            self.progress.close()
+            self.progress.deleteLater()
+            self.progress = None
+
+        self.set_save_buttons_enabled(True)
+
+        self.statusBar().showMessage(
+            "Surat berhasil dibuat.",
+            7000,
+        )
+
+        self.load_archive()
+
+        word_path = result.get("word", "")
+        pdf_path = result.get("pdf", "")
+
+        message = (
+            "Surat berhasil dibuat.\n\n"
+            f"Pegawai : {result.get('employee', '')}\n"
+            f"Jenis   : {result.get('jenis', '')}\n\n"
+            f"Word:\n{word_path}\n\n"
+            f"PDF:\n{pdf_path}"
+        )
+
+        box = QMessageBox(self)
+        box.setWindowTitle(
+            "Surat Berhasil Dibuat"
+        )
+        box.setText(message)
+
+        open_word = box.addButton(
+            "Buka Word",
+            QMessageBox.AcceptRole
+        )
+
+        open_pdf = box.addButton(
+            "Buka PDF",
+            QMessageBox.AcceptRole
+        )
+
+        open_folder = box.addButton(
+            "Buka Folder",
+            QMessageBox.AcceptRole
+        )
+
+        box.addButton(
+            "Tutup",
+            QMessageBox.RejectRole
+        )
+
+        box.exec()
+
+        clicked = box.clickedButton()
+
+        if clicked == open_word:
+            self.open_file(word_path)
+
+        elif clicked == open_pdf:
+            self.open_file(pdf_path)
+
+        elif clicked == open_folder:
+            self.open_folder(
+                str(Path(pdf_path).parent)
+            )
+
+    # ========================================================
+    # THREAD ERROR
+    # ========================================================
+
+    def letter_error(self, message):
+
+        if self.progress:
+            self.progress.close()
+            self.progress.deleteLater()
+            self.progress = None
+
+        self.set_save_buttons_enabled(True)
+
+        self.statusBar().showMessage(
+            "Gagal membuat surat.",
+            7000,
+        )
+
+        QMessageBox.critical(
+            self,
+            "Gagal Membuat Surat",
+            "Surat tidak berhasil dibuat.\n\n"
+            + message
+        )
+
+    # ========================================================
+    # ENABLE / DISABLE SAVE BUTTON
+    # ========================================================
+
+    def set_save_buttons_enabled(self, enabled):
+
+        for name in (
+            "i_save_button",
+            "s_save_button",
+            "c_save_button",
+        ):
+            if hasattr(self, name):
+                getattr(
+                    self,
+                    name
+                ).setEnabled(enabled)
+
+    # ========================================================
+    # SAFE FILENAME
+    # ========================================================
+
+    def safe_filename(self, text):
+
+        invalid = '<>:"/\\|?*'
+
+        result = str(text)
+
+        for char in invalid:
+            result = result.replace(
+                char,
+                "_"
+            )
+
+        return result.strip() or "pegawai"
+
+    # ========================================================
+    # ARSIP
+    # ========================================================
+
+
+    def create_lembur_tab(self):
+        """Form pembuatan daftar hadir kerja lembur multi-tanggal."""
+
+        self.lembur_tab = QWidget()
+        layout = QVBoxLayout(self.lembur_tab)
+        layout.setContentsMargins(18, 18, 18, 18)
+        layout.setSpacing(14)
+
+        # ---------------------------------------------------------
+        # JUDUL
+        # ---------------------------------------------------------
+        title = QLabel("LEMBUR")
+        title.setStyleSheet("""
+            QLabel {
+                font-size: 20pt;
+                font-weight: bold;
+                color: #0d3f48;
+                padding-bottom: 4px;
+            }
+        """)
+        layout.addWidget(title)
+
+        subtitle = QLabel(
+            "Buat satu surat lembur untuk beberapa tanggal. "
+            "Jam dan total lembur dihitung otomatis untuk setiap tanggal."
+        )
+        subtitle.setStyleSheet("""
+            QLabel {
+                color: #60757a;
+                font-size: 10pt;
+                padding-bottom: 8px;
+            }
+        """)
+        layout.addWidget(subtitle)
+
+        # ---------------------------------------------------------
+        # DATA PEGAWAI DAN SURAT
+        # ---------------------------------------------------------
+        form_box = QGroupBox("Data Lembur")
+        form = QFormLayout(form_box)
+        form.setContentsMargins(18, 18, 18, 18)
+        form.setHorizontalSpacing(18)
+        form.setVerticalSpacing(12)
+
+        self.lembur_employee_combo = QComboBox()
+        self.lembur_employee_combo.setMinimumHeight(38)
+        self.lembur_employee_combo.setMinimumWidth(350)
+
+        conn = get_connection()
+        rows = conn.execute("""
+            SELECT id, nama, nip, jabatan
+            FROM pegawai
+            ORDER BY nama
+        """).fetchall()
+        conn.close()
+
+        self.lembur_employee_combo.addItem(
+            "-- Pilih Pegawai --",
+            None
+        )
+
+        for row in rows:
+            nama = row["nama"] or ""
+            nip = row["nip"] or ""
+
+            display = f"{nama} ? {nip}" if nip else nama
+            self.lembur_employee_combo.addItem(
+                display,
+                row["id"]
+            )
+
+        self.lembur_employee_combo.currentIndexChanged.connect(
+            self.update_lembur_employee_info
+        )
+
+        form.addRow(
+            "Pegawai",
+            self.lembur_employee_combo
+        )
+
+        self.lembur_employee_name = QLineEdit()
+        self.lembur_employee_name.setReadOnly(True)
+        self.lembur_employee_name.setPlaceholderText(
+            "Otomatis mengikuti pegawai yang dipilih"
+        )
+        form.addRow(
+            "Nama Pelaksana",
+            self.lembur_employee_name
+        )
+
+        self.lembur_employee_nip = QLineEdit()
+        self.lembur_employee_nip.setReadOnly(True)
+        self.lembur_employee_nip.setPlaceholderText(
+            "Otomatis mengikuti pegawai yang dipilih"
+        )
+        form.addRow(
+            "NIP / NIPK Pelaksana",
+            self.lembur_employee_nip
+        )
+
+        self.lembur_letter_date = QDateEdit()
+        self.lembur_letter_date.setCalendarPopup(True)
+        self.lembur_letter_date.setDate(QDate.currentDate())
+        self.lembur_letter_date.setDisplayFormat("dd/MM/yyyy")
+        self.lembur_letter_date.setMinimumHeight(38)
+        self.lembur_letter_date.setMinimumWidth(180)
+        self.lembur_letter_date.setKeyboardTracking(False)
+
+        form.addRow(
+            "Tanggal Pembuatan Surat",
+            self.lembur_letter_date
+        )
+
+        layout.addWidget(form_box)
+
+        # ---------------------------------------------------------
+        # INPUT TANGGAL LEMBUR
+        # ---------------------------------------------------------
+        input_box = QGroupBox("Tambah Tanggal Lembur")
+        input_layout = QVBoxLayout(input_box)
+        input_layout.setContentsMargins(18, 18, 18, 18)
+        input_layout.setSpacing(10)
+
+        row_input = QHBoxLayout()
+        row_input.setSpacing(10)
+
+        date_label = QLabel("Tanggal")
+        self.lembur_date = QDateEdit()
+        self.lembur_date.setCalendarPopup(True)
+        self.lembur_date.setDate(QDate.currentDate())
+        self.lembur_date.setDisplayFormat("dd/MM/yyyy")
+        self.lembur_date.setMinimumHeight(38)
+        self.lembur_date.setMinimumWidth(145)
+
+        start_label = QLabel("Mulai")
+        self.lembur_start = QTimeEdit()
+        self.lembur_start.setDisplayFormat("HH:mm")
+        self.lembur_start.setTime(QTime(17, 0))
+        self.lembur_start.setMinimumHeight(38)
+        self.lembur_start.setMinimumWidth(100)
+        self.lembur_start.setKeyboardTracking(False)
+
+        end_label = QLabel("Selesai")
+        self.lembur_end = QTimeEdit()
+        self.lembur_end.setDisplayFormat("HH:mm")
+        self.lembur_end.setTime(QTime(21, 0))
+        self.lembur_end.setMinimumHeight(38)
+        self.lembur_end.setMinimumWidth(100)
+        self.lembur_end.setKeyboardTracking(False)
+
+        total_label = QLabel("Durasi")
+        self.lembur_total = QLineEdit()
+        self.lembur_total.setReadOnly(True)
+        self.lembur_total.setMinimumHeight(38)
+        self.lembur_total.setMinimumWidth(90)
+        self.lembur_total.setPlaceholderText("Otomatis")
+
+        row_input.addWidget(date_label)
+        row_input.addWidget(self.lembur_date)
+        row_input.addWidget(start_label)
+        row_input.addWidget(self.lembur_start)
+        row_input.addWidget(end_label)
+        row_input.addWidget(self.lembur_end)
+        row_input.addWidget(total_label)
+        row_input.addWidget(self.lembur_total)
+
+        input_layout.addLayout(row_input)
+
+        report_label = QLabel("Laporan Lembur")
+        self.lembur_report = QTextEdit()
+        self.lembur_report.setMinimumHeight(80)
+        self.lembur_report.setPlaceholderText(
+            "Masukkan laporan/kegiatan lembur untuk tanggal ini."
+        )
+
+        input_layout.addWidget(report_label)
+        input_layout.addWidget(self.lembur_report)
+
+        add_layout = QHBoxLayout()
+        add_layout.addStretch()
+
+        self.lembur_add_button = QPushButton(
+            "? Tambah Tanggal Lembur"
+        )
+        self.lembur_add_button.setMinimumHeight(40)
+        self.lembur_add_button.setMinimumWidth(210)
+        self.lembur_add_button.clicked.connect(
+            self.add_lembur_item
+        )
+
+        add_layout.addWidget(self.lembur_add_button)
+        input_layout.addLayout(add_layout)
+
+        layout.addWidget(input_box)
+
+        # ---------------------------------------------------------
+        # DAFTAR TANGGAL LEMBUR
+        # ---------------------------------------------------------
+        list_box = QGroupBox("Daftar Tanggal Lembur")
+        list_layout = QVBoxLayout(list_box)
+        list_layout.setContentsMargins(18, 18, 18, 18)
+
+        self.lembur_items_table = QTableWidget()
+        self.lembur_items_table.setColumnCount(7)
+        self.lembur_items_table.setHorizontalHeaderLabels([
+            "No",
+            "Tanggal",
+            "Jam Mulai",
+            "Jam Selesai",
+            "Total",
+            "Laporan",
+            "Aksi",
+        ])
+
+        self.lembur_items_table.setMinimumHeight(220)
+        self.lembur_items_table.setAlternatingRowColors(True)
+        self.lembur_items_table.setSelectionBehavior(
+            QTableWidget.SelectRows
+        )
+        self.lembur_items_table.setEditTriggers(
+            QTableWidget.NoEditTriggers
+        )
+
+        header = self.lembur_items_table.horizontalHeader()
+        header.setSectionResizeMode(
+            0,
+            QHeaderView.ResizeToContents
+        )
+        header.setSectionResizeMode(
+            1,
+            QHeaderView.ResizeToContents
+        )
+        header.setSectionResizeMode(
+            2,
+            QHeaderView.ResizeToContents
+        )
+        header.setSectionResizeMode(
+            3,
+            QHeaderView.ResizeToContents
+        )
+        header.setSectionResizeMode(
+            4,
+            QHeaderView.ResizeToContents
+        )
+        header.setSectionResizeMode(
+            5,
+            QHeaderView.Stretch
+        )
+        header.setSectionResizeMode(
+            6,
+            QHeaderView.ResizeToContents
+        )
+
+        list_layout.addWidget(self.lembur_items_table)
+
+        total_layout = QHBoxLayout()
+        total_layout.addStretch()
+
+        total_text = QLabel("TOTAL SELURUH LEMBUR:")
+        total_text.setStyleSheet("""
+            QLabel {
+                font-weight: bold;
+                font-size: 10pt;
+                color: #0d3f48;
+            }
+        """)
+
+        self.lembur_grand_total = QLabel("0 jam")
+        self.lembur_grand_total.setStyleSheet("""
+            QLabel {
+                font-weight: bold;
+                font-size: 13pt;
+                color: #0f6b78;
+            }
+        """)
+
+        total_layout.addWidget(total_text)
+        total_layout.addWidget(self.lembur_grand_total)
+
+        list_layout.addLayout(total_layout)
+
+        layout.addWidget(list_box)
+
+        # ---------------------------------------------------------
+        # TOMBOL BUAT SURAT
+        # ---------------------------------------------------------
+        button_layout = QHBoxLayout()
+        button_layout.addStretch()
+
+        self.l_save_button = QPushButton(
+            "Buat Surat Lembur"
+        )
+        self.l_save_button.setMinimumHeight(42)
+        self.l_save_button.setMinimumWidth(190)
+        self.l_save_button.clicked.connect(
+            self.save_lembur
+        )
+
+        button_layout.addWidget(self.l_save_button)
+        layout.addLayout(button_layout)
+
+        layout.addStretch()
+
+        # ---------------------------------------------------------
+        # DATA INTERNAL MULTI-TANGGAL
+        # ---------------------------------------------------------
+        self.lembur_items = []
+
+        self.lembur_start.timeChanged.connect(
+            self.update_lembur_duration
+        )
+        self.lembur_end.timeChanged.connect(
+            self.update_lembur_duration
+        )
+
+        self.update_lembur_duration()
+
+        self.tabs.addTab(
+            self.lembur_tab,
+            "? Lembur"
+        )
+
+    def add_lembur_item(self):
+        """Menambahkan satu tanggal lembur ke daftar multi-tanggal."""
+
+        # Pastikan pegawai sudah dipilih
+        employee_id = self.lembur_employee_combo.currentData()
+
+        if not employee_id:
+            QMessageBox.warning(
+                self,
+                "Data Belum Lengkap",
+                "Silakan pilih pegawai terlebih dahulu."
+            )
+            return
+
+        # Ambil tanggal
+        qdate = self.lembur_date.date()
+        tanggal_iso = qdate.toString("yyyy-MM-dd")
+        tanggal_display = qdate.toString("dd/MM/yyyy")
+
+        # Ambil jam
+        start = self.lembur_start.time()
+        end = self.lembur_end.time()
+
+        start_minutes = (
+            start.hour() * 60
+            + start.minute()
+        )
+
+        end_minutes = (
+            end.hour() * 60
+            + end.minute()
+        )
+
+        # Mendukung lembur melewati tengah malam
+        if end_minutes >= start_minutes:
+            duration_minutes = end_minutes - start_minutes
+        else:
+            duration_minutes = (
+                24 * 60 - start_minutes + end_minutes
+            )
+
+        if duration_minutes <= 0:
+            QMessageBox.warning(
+                self,
+                "Jam Tidak Valid",
+                "Jam selesai lembur harus berbeda dari jam mulai."
+            )
+            return
+
+        # Cegah tanggal yang sama
+        for item in self.lembur_items:
+            if item.get("tanggal_iso") == tanggal_iso:
+                QMessageBox.warning(
+                    self,
+                    "Tanggal Sudah Ada",
+                    f"Tanggal {tanggal_display} sudah ada "
+                    "dalam daftar lembur."
+                )
+                return
+
+        jam = duration_minutes // 60
+        menit = duration_minutes % 60
+
+        if menit:
+            total_text = f"{jam} jam {menit} menit"
+        else:
+            total_text = f"{jam} jam"
+
+        jam_mulai = start.toString("HH:mm")
+        jam_selesai = end.toString("HH:mm")
+        rentang = f"{jam_mulai} s.d {jam_selesai}"
+
+        laporan = self.lembur_report.toPlainText().strip()
+
+        item = {
+            "tanggal": tanggal_display,
+            "tanggal_iso": tanggal_iso,
+            "jam_mulai": jam_mulai,
+            "jam_selesai": jam_selesai,
+            "rentang_jam": rentang,
+            "total": total_text,
+            "total_menit": duration_minutes,
+            "laporan": laporan,
+        }
+
+        self.lembur_items.append(item)
+
+        self.refresh_lembur_items_table()
+
+        # Otomatis pindahkan tanggal ke hari berikutnya
+        self.lembur_date.setDate(
+            qdate.addDays(1)
+        )
+
+        # Bersihkan laporan agar siap untuk tanggal berikutnya
+        self.lembur_report.clear()
+
+    def remove_lembur_item(self, index):
+        """Menghapus satu tanggal dari daftar lembur."""
+
+        if index < 0 or index >= len(self.lembur_items):
+            return
+
+        item = self.lembur_items[index]
+        tanggal = item.get("tanggal", "")
+
+        reply = QMessageBox.question(
+            self,
+            "Hapus Tanggal",
+            f"Hapus tanggal lembur {tanggal}?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+
+        if reply != QMessageBox.Yes:
+            return
+
+        self.lembur_items.pop(index)
+        self.refresh_lembur_items_table()
+
+    def refresh_lembur_items_table(self):
+        """Memperbarui tabel daftar tanggal lembur."""
+
+        self.lembur_items_table.setRowCount(0)
+
+        total_minutes = 0
+
+        for index, item in enumerate(
+            self.lembur_items
+        ):
+            row = self.lembur_items_table.rowCount()
+            self.lembur_items_table.insertRow(row)
+
+            self.lembur_items_table.setItem(
+                row,
+                0,
+                QTableWidgetItem(str(index + 1))
+            )
+
+            self.lembur_items_table.setItem(
+                row,
+                1,
+                QTableWidgetItem(
+                    item.get("tanggal", "")
+                )
+            )
+
+            self.lembur_items_table.setItem(
+                row,
+                2,
+                QTableWidgetItem(
+                    item.get("jam_mulai", "")
+                )
+            )
+
+            self.lembur_items_table.setItem(
+                row,
+                3,
+                QTableWidgetItem(
+                    item.get("jam_selesai", "")
+                )
+            )
+
+            self.lembur_items_table.setItem(
+                row,
+                4,
+                QTableWidgetItem(
+                    item.get("total", "")
+                )
+            )
+
+            laporan = item.get("laporan", "")
+
+            if not laporan:
+                laporan = "-"
+
+            self.lembur_items_table.setItem(
+                row,
+                5,
+                QTableWidgetItem(laporan)
+            )
+
+            delete_button = QPushButton("Hapus")
+            delete_button.setMinimumHeight(30)
+
+            delete_button.clicked.connect(
+                lambda checked=False, i=index:
+                    self.remove_lembur_item(i)
+            )
+
+            self.lembur_items_table.setCellWidget(
+                row,
+                6,
+                delete_button
+            )
+
+            total_minutes += int(
+                item.get("total_menit", 0) or 0
+            )
+
+        total_hours = total_minutes // 60
+        total_remainder = total_minutes % 60
+
+        if total_remainder:
+            total_text = (
+                f"{total_hours} jam "
+                f"{total_remainder} menit"
+            )
+        else:
+            total_text = f"{total_hours} jam"
+
+        self.lembur_grand_total.setText(
+            total_text
+        )
+
+    def update_lembur_duration(self):
+        """Menghitung durasi lembur pada input tanggal aktif."""
+
+        start = self.lembur_start.time()
+        end = self.lembur_end.time()
+
+        start_minutes = (
+            start.hour() * 60
+            + start.minute()
+        )
+
+        end_minutes = (
+            end.hour() * 60
+            + end.minute()
+        )
+
+        if end_minutes >= start_minutes:
+            duration_minutes = end_minutes - start_minutes
+        else:
+            duration_minutes = (
+                24 * 60 - start_minutes + end_minutes
+            )
+
+        if duration_minutes <= 0:
+            self.lembur_total.setText("")
+            return
+
+        jam = duration_minutes // 60
+        menit = duration_minutes % 60
+
+        if menit:
+            text = f"{jam} jam {menit} menit"
+        else:
+            text = f"{jam} jam"
+
+        self.lembur_total.setText(text)
+
+    def update_lembur_employee_info(self):
+        """Menampilkan nama dan NIP/NIPK pegawai yang dipilih."""
+        employee_id = self.lembur_employee_combo.currentData()
+
+        self.lembur_employee_name.clear()
+        self.lembur_employee_nip.clear()
+
+        if not employee_id:
+            return
+
+        conn = get_connection()
+        cur = conn.cursor()
+
+        cur.execute(
+            """
+            SELECT nama, nip
+            FROM pegawai
+            WHERE id = ?
+            """,
+            (employee_id,)
+        )
+
+        row = cur.fetchone()
+        conn.close()
+
+        if row:
+            self.lembur_employee_name.setText(row[0] or "")
+            self.lembur_employee_nip.setText(row[1] or "")
+
+
+    def save_lembur(self):
+        """Membuat satu surat lembur untuk beberapa tanggal."""
+
+        employee_id = self.lembur_employee_combo.currentData()
+
+        if not employee_id:
+            QMessageBox.warning(
+                self,
+                "Data Belum Lengkap",
+                "Silakan pilih pegawai terlebih dahulu."
+            )
+            return
+
+        # ----------------------------------------------------
+        # PASTIKAN ADA TANGGAL LEMBUR
+        # ----------------------------------------------------
+        if not self.lembur_items:
+            QMessageBox.warning(
+                self,
+                "Tanggal Lembur Belum Ada",
+                "Tambahkan minimal satu tanggal lembur terlebih dahulu."
+            )
+            return
+
+        # ----------------------------------------------------
+        # TANGGAL PEMBUATAN SURAT
+        # ----------------------------------------------------
+        tanggal_surat = self.lembur_letter_date.date()
+
+        tanggal_surat_iso = tanggal_surat.toString("yyyy-MM-dd")
+
+        tanggal_surat_text = (
+            f"{tanggal_surat.day()} "
+            f"{BULAN_ID[tanggal_surat.month() - 1]} "
+            f"{tanggal_surat.year()}"
+        )
+
+        # ----------------------------------------------------
+        # AMBIL DATA PEGAWAI
+        # ----------------------------------------------------
+        conn = get_connection()
+
+        row = conn.execute(
+            """
+            SELECT *
+            FROM pegawai
+            WHERE id = ?
+            """,
+            (employee_id,)
+        ).fetchone()
+
+        conn.close()
+
+        if not row:
+            QMessageBox.warning(
+                self,
+                "Data Tidak Ditemukan",
+                "Data pegawai tidak ditemukan."
+            )
+            return
+
+        nama = row["nama"] or ""
+        nip = row["nip"] or ""
+        jabatan = row["jabatan"] or ""
+        unit_kerja = row["unit_kerja"] or ""
+
+        # ----------------------------------------------------
+        # SIAPKAN DATA UNTUK TEMPLATE
+        # ----------------------------------------------------
+        template_items = []
+
+        for item in self.lembur_items:
+
+            iso = item.get("tanggal_iso", "")
+
+            try:
+                qdate = QDate.fromString(
+                    iso,
+                    "yyyy-MM-dd"
+                )
+
+                tanggal_text = (
+                    f"{qdate.day()} "
+                    f"{BULAN_ID[qdate.month() - 1]} "
+                    f"{qdate.year()}"
+                )
+
+            except Exception:
+                tanggal_text = item.get(
+                    "tanggal",
+                    ""
+                )
+
+            template_items.append({
+                "tanggal": tanggal_text,
+                "tanggal_iso": iso,
+                "jam_mulai": item.get(
+                    "jam_mulai",
+                    ""
+                ),
+                "jam_selesai": item.get(
+                    "jam_selesai",
+                    ""
+                ),
+                "rentang_jam": item.get(
+                    "rentang_jam",
+                    ""
+                ),
+                "total": item.get(
+                    "total",
+                    ""
+                ),
+                "total_menit": int(
+                    item.get(
+                        "total_menit",
+                        0
+                    ) or 0
+                ),
+                "laporan": item.get(
+                    "laporan",
+                    ""
+                ),
+            })
+
+        # ----------------------------------------------------
+        # NILAI UTAMA
+        # ----------------------------------------------------
+        first_item = template_items[0]
+
+        values = {
+            "NAMA": nama,
+            "NIP": nip,
+            "JABATAN": jabatan,
+            "UNIT_KERJA": unit_kerja,
+
+            # Kompatibilitas dengan format lama
+            "TANGGAL": first_item["tanggal"],
+            "TANGGAL_LEMBUR": first_item["tanggal"],
+            "TANGGAL_ISO": first_item["tanggal_iso"],
+
+            "TANGGAL_SURAT": tanggal_surat_text,
+            "TANGGAL_PEMBUATAN_SURAT": tanggal_surat_text,
+            "TANGGAL_SURAT_ISO": tanggal_surat_iso,
+
+            "JAM_MULAI": first_item["jam_mulai"],
+            "JAM_SELESAI": first_item["jam_selesai"],
+            "RENTANG_JAM": first_item["rentang_jam"],
+            "RENTANG_JAM_LEMBUR": first_item["rentang_jam"],
+            "TOTAL_JAM": first_item["total"],
+            "TOTAL_JAM_LEMBUR": first_item["total"],
+            "LAPORAN_LEMBUR": first_item["laporan"],
+
+            # DATA BARU MULTI-TANGGAL
+            "LEMBUR_ITEMS": template_items,
+        }
+
+        employee = {
+            "id": employee_id,
+            "nama": nama,
+            "nip": nip,
+            "jabatan": jabatan,
+            "unit_kerja": unit_kerja,
+        }
+
+        # ----------------------------------------------------
+        # BUAT SATU SURAT
+        # ----------------------------------------------------
+        template_name = (
+            "DAFTAR HADIR KERJA LEMBUR.docx"
+        )
+
+        self.start_lembur_worker(
+            template_name,
+            employee,
+            tanggal_surat_text,
+            tanggal_surat_iso,
+            values,
+            employee_id,
+            template_items,
+        )
+
+
+    def start_lembur_worker(
+        self,
+        template_name,
+        employee,
+        tanggal_surat_text,
+        tanggal_surat_iso,
+        values,
+        employee_id,
+        items,
+    ):
+        """Worker khusus pembuatan surat lembur multi-tanggal."""
+
+        timestamp = datetime.now().strftime(
+            "%Y%m%d_%H%M%S"
+        )
+
+        safe_name = self.safe_filename(
+            employee.get("nama") or "pegawai"
+        )
+
+        output_name = (
+            f"Lembur_{safe_name}_{timestamp}.docx"
+        )
+
+        self.set_save_buttons_enabled(False)
+
+        self.progress = QProgressDialog(
+            "Sedang membuat surat lembur...",
+            None,
+            0,
+            0,
+            self,
+        )
+
+        self.progress.setWindowTitle("LetterSync")
+        self.progress.setCancelButton(None)
+        self.progress.setMinimumDuration(0)
+        self.progress.setWindowModality(Qt.WindowModal)
+        self.progress.show()
+
+        self.statusBar().showMessage(
+            "Sedang membuat surat lembur..."
+        )
+
+        QApplication.processEvents()
+
+        def do_work():
+
+            # ================================================
+            # WORD
+            # ================================================
+            render_template(
+                template_name,
+                output_name,
+                values,
+            )
+
+            docx_path = WORD_DIR / output_name
+
+            if not docx_path.exists():
+                raise FileNotFoundError(
+                    f"File Word tidak ditemukan:\n{docx_path}"
+                )
+
+            # ================================================
+            # PDF
+            # ================================================
+            pdf_path = create_pdf_from_docx(
+                docx_path
+            )
+
+            # ================================================
+            # SIMPAN SEMUA DETAIL TANGGAL
+            # ================================================
+            conn = get_connection()
+
+            try:
+                for item in items:
+
+                    conn.execute("""
+                        INSERT INTO lembur (
+                            pegawai_id,
+                            tanggal,
+                            tanggal_surat,
+                            jam_mulai,
+                            jam_selesai,
+                            rentang_jam,
+                            total_jam,
+                            laporan_lembur,
+                            status,
+                            file_path,
+                            pdf_path
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        employee_id,
+                        item.get(
+                            "tanggal_iso",
+                            ""
+                        ),
+                        tanggal_surat_iso,
+                        item.get(
+                            "jam_mulai",
+                            ""
+                        ),
+                        item.get(
+                            "jam_selesai",
+                            ""
+                        ),
+                        item.get(
+                            "rentang_jam",
+                            ""
+                        ),
+                        item.get(
+                            "total",
+                            ""
+                        ),
+                        item.get(
+                            "laporan",
+                            ""
+                        ),
+                        "Selesai",
+                        str(docx_path),
+                        (
+                            str(pdf_path)
+                            if pdf_path
+                            else None
+                        ),
+                    ))
+
+                conn.commit()
+
+            except Exception:
+                conn.rollback()
+                raise
+
+            finally:
+                conn.close()
+
+            return {
+                "word": str(docx_path),
+                "pdf": (
+                    str(pdf_path)
+                    if pdf_path
+                    else ""
+                ),
+                "jenis": "Lembur",
+                "jumlah_tanggal": len(items),
+            }
+
+        # ================================================
+        # WORKER THREAD
+        # ================================================
+        self.worker_thread = QThread()
+        self.worker = LetterWorker(
+            do_work
+        )
+        self.worker.moveToThread(
+            self.worker_thread
+        )
+
+        self.worker_thread.started.connect(
+            self.worker.run
+        )
+
+        self.worker.finished.connect(
+            self.lembur_finished
+        )
+
+        self.worker.error.connect(
+            self.lembur_error
+        )
+
+        self.worker.finished.connect(
+            self.worker_thread.quit
+        )
+
+        self.worker.error.connect(
+            self.worker_thread.quit
+        )
+
+        self.worker_thread.finished.connect(
+            self.worker.deleteLater
+        )
+
+        self.worker_thread.finished.connect(
+            self.worker_thread.deleteLater
+        )
+
+        self.worker_thread.start()
+
+
+    def lembur_finished(self, result):
+        """Dipanggil setelah surat lembur berhasil dibuat."""
+
+        self.set_save_buttons_enabled(True)
+
+        if hasattr(self, "progress") and self.progress:
+            self.progress.close()
+            self.progress.deleteLater()
+            self.progress = None
+
+        self.statusBar().showMessage(
+            "Surat lembur berhasil dibuat."
+        )
+
+        # Refresh Arsip agar surat lembur langsung muncul
+        try:
+            self.load_archive()
+        except Exception as e:
+            print("Gagal refresh Arsip:", e)
+
+        word_path = result.get("word", "")
+        pdf_path = result.get("pdf", "")
+
+        msg = QMessageBox(self)
+        msg.setWindowTitle("Berhasil")
+        msg.setIcon(QMessageBox.Information)
+        msg.setText(
+            "Surat lembur berhasil dibuat."
+        )
+
+        open_word = msg.addButton(
+            "Buka Word",
+            QMessageBox.AcceptRole
+        )
+
+        open_pdf = msg.addButton(
+            "Buka PDF",
+            QMessageBox.AcceptRole
+        )
+
+        open_folder = msg.addButton(
+            "Buka Folder",
+            QMessageBox.AcceptRole
+        )
+
+        msg.addButton(
+            "Tutup",
+            QMessageBox.RejectRole
+        )
+
+        msg.exec()
+
+        clicked = msg.clickedButton()
+
+        if clicked == open_word:
+            if word_path:
+                QDesktopServices.openUrl(
+                    QUrl.fromLocalFile(word_path)
+                )
+
+        elif clicked == open_pdf:
+            if pdf_path:
+                QDesktopServices.openUrl(
+                    QUrl.fromLocalFile(pdf_path)
+                )
+
+        elif clicked == open_folder:
+            if word_path:
+                QDesktopServices.openUrl(
+                    QUrl.fromLocalFile(
+                        str(Path(word_path).parent)
+                    )
+                )
+
+        # Bersihkan laporan setelah surat dibuat,
+        # tetapi pertahankan data tanggal/jam terakhir.
+        self.lembur_report.clear()
+
+
+    def lembur_error(self, error_text):
+        """Menampilkan error pembuatan surat lembur."""
+
+        self.set_save_buttons_enabled(True)
+
+        if hasattr(self, "progress") and self.progress:
+            self.progress.close()
+            self.progress.deleteLater()
+            self.progress = None
+
+        self.statusBar().showMessage(
+            "Gagal membuat surat lembur."
+        )
+
+        QMessageBox.critical(
+            self,
+            "Gagal Membuat Surat Lembur",
+            "Terjadi kesalahan saat membuat surat lembur.\n\n"
+            + error_text,
+        )
+
+
+    def create_archive_tab(self):
+
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+
+        buttons = QHBoxLayout()
+
+        refresh = QPushButton(
+            "Refresh Arsip"
+        )
+
+        refresh.clicked.connect(
+            self.load_archive
+        )
+
+        delete_btn = QPushButton(
+            "Hapus Arsip"
+        )
+
+        delete_btn.clicked.connect(
+            self.delete_archive
+        )
+
+        buttons.addWidget(refresh)
+        buttons.addWidget(delete_btn)
+        buttons.addStretch()
+
+        layout.addLayout(buttons)
+
+        self.archive_table = QTableWidget()
+
+        self.archive_table.setColumnCount(8)
+
+        self.archive_table.setHorizontalHeaderLabels([
+            "ID",
+            "Jenis",
+            "Pegawai",
+            "Tanggal",
+            "Status",
+            "Word",
+            "PDF",
+            "Dibuat",
+        ])
+
+        self.archive_table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.Stretch
+        )
+
+        layout.addWidget(
+            self.archive_table
+        )
+
+        self.tabs.addTab(
+            tab,
+            "Arsip"
+        )
+
+    def load_archive(self):
+
+        if not hasattr(
+            self,
+            "archive_table"
+        ):
+            return
+
+        conn = get_connection()
+        cur = conn.cursor()
+
+        # ====================================================
+        # SURAT BIASA
+        # ====================================================
+        cur.execute("""
+            SELECT
+                surat.id AS id,
+                surat.jenis AS jenis,
+                pegawai.nama AS pegawai,
+                surat.tanggal_surat AS tanggal,
+                surat.status AS status,
+                surat.file_path AS file_path,
+                surat.pdf_path AS pdf_path,
+                surat.created_at AS created_at
+            FROM surat
+            LEFT JOIN pegawai
+                ON pegawai.id = surat.pegawai_id
+        """)
+
+        surat_rows = cur.fetchall()
+
+        # ====================================================
+        # SEMUA DATA LEMBUR
+        #
+        # Setiap tanggal lembur memang disimpan sebagai satu
+        # detail database, tetapi beberapa detail yang memiliki
+        # file Word yang sama dianggap sebagai SATU dokumen.
+        # ====================================================
+        cur.execute("""
+            SELECT
+                lembur.id AS id,
+                'Lembur' AS jenis,
+                pegawai.nama AS pegawai,
+                lembur.tanggal AS tanggal,
+                lembur.tanggal_surat AS tanggal_surat,
+                lembur.status AS status,
+                lembur.file_path AS file_path,
+                lembur.pdf_path AS pdf_path,
+                lembur.created_at AS created_at
+            FROM lembur
+            LEFT JOIN pegawai
+                ON pegawai.id = lembur.pegawai_id
+        """)
+
+        lembur_rows = cur.fetchall()
+
+        conn.close()
+
+        # ====================================================
+        # SIAPKAN ARSIP
+        # ====================================================
+        archive_rows = []
+
+        # Surat biasa tetap satu record = satu arsip
+        for row in surat_rows:
+            archive_rows.append({
+                "id": str(row["id"]),
+                "jenis": row["jenis"] or "",
+                "pegawai": row["pegawai"] or "",
+                "tanggal": row["tanggal"] or "",
+                "status": row["status"] or "",
+                "file_path": row["file_path"] or "",
+                "pdf_path": row["pdf_path"] or "",
+                "created_at": row["created_at"] or "",
+            })
+
+        # ====================================================
+        # KELOMPOKKAN LEMBUR BERDASARKAN FILE WORD
+        # ====================================================
+        lembur_groups = {}
+
+        for row in lembur_rows:
+
+            file_path = (
+                row["file_path"]
+                or f"__LEMBUR_ID_{row['id']}"
+            )
+
+            if file_path not in lembur_groups:
+                lembur_groups[file_path] = {
+                    "ids": [],
+                    "jenis": "Lembur",
+                    "pegawai": row["pegawai"] or "",
+                    "tanggal": [],
+                    "status": row["status"] or "",
+                    "file_path": row["file_path"] or "",
+                    "pdf_path": row["pdf_path"] or "",
+                    "created_at": row["created_at"] or "",
+                }
+
+            group = lembur_groups[file_path]
+
+            group["ids"].append(
+                str(row["id"])
+            )
+
+            # Untuk lembur gunakan tanggal aktual lemburnya,
+            # bukan tanggal pembuatan surat.
+            tanggal = (
+                row["tanggal"]
+                or row["tanggal_surat"]
+                or ""
+            )
+
+            if tanggal and tanggal not in group["tanggal"]:
+                group["tanggal"].append(tanggal)
+
+            # Ambil data file/status yang tersedia
+            if not group["file_path"]:
+                group["file_path"] = (
+                    row["file_path"] or ""
+                )
+
+            if not group["pdf_path"]:
+                group["pdf_path"] = (
+                    row["pdf_path"] or ""
+                )
+
+            if not group["created_at"]:
+                group["created_at"] = (
+                    row["created_at"] or ""
+                )
+
+        # ====================================================
+        # MASUKKAN GROUP LEMBUR KE ARSIP
+        # ====================================================
+        for group in lembur_groups.values():
+
+            # Urutkan tanggal ISO
+            group["tanggal"].sort()
+
+            archive_rows.append({
+                "id": ", ".join(group["ids"]),
+                "jenis": group["jenis"],
+                "pegawai": group["pegawai"],
+                "tanggal": ", ".join(
+                    group["tanggal"]
+                ),
+                "status": group["status"],
+                "file_path": group["file_path"],
+                "pdf_path": group["pdf_path"],
+                "created_at": group["created_at"],
+            })
+
+        # ====================================================
+        # URUTKAN TERBARU
+        # ====================================================
+        archive_rows.sort(
+            key=lambda x: x.get(
+                "created_at",
+                ""
+            ) or "",
+            reverse=True
+        )
+
+        # ====================================================
+        # TAMPILKAN
+        # ====================================================
+        self.archive_table.setRowCount(
+            len(archive_rows)
+        )
+
+        for r, row in enumerate(
+            archive_rows
+        ):
+
+            values = [
+                row["id"],
+                row["jenis"],
+                row["pegawai"],
+                row["tanggal"],
+                row["status"],
+                row["file_path"],
+                row["pdf_path"],
+                row["created_at"],
+            ]
+
+            for c, value in enumerate(values):
+
+                item = QTableWidgetItem(
+                    str(value)
+                )
+
+                self.archive_table.setItem(
+                    r,
+                    c,
+                    item
+                )
+
+    def delete_archive(self):
+
+        if not hasattr(
+            self,
+            "archive_table"
+        ):
+            return
+
+        selected = self.archive_table.currentRow()
+
+        if selected < 0:
+            QMessageBox.information(
+                self,
+                "Hapus Arsip",
+                "Silakan pilih arsip yang ingin dihapus."
+            )
+            return
+
+        id_item = self.archive_table.item(
+            selected,
+            0
+        )
+
+        jenis_item = self.archive_table.item(
+            selected,
+            1
+        )
+
+        pegawai_item = self.archive_table.item(
+            selected,
+            2
+        )
+
+        if not id_item or not jenis_item:
+            return
+
+        record_id = id_item.text().strip()
+
+        jenis = jenis_item.text().strip()
+
+        pegawai = (
+            pegawai_item.text().strip()
+            if pegawai_item
+            else ""
+        )
+
+        # Path file menjadi identitas dokumen.
+        word_item = self.archive_table.item(
+            selected,
+            5
+        )
+
+        pdf_item = self.archive_table.item(
+            selected,
+            6
+        )
+
+        word_path = (
+            word_item.text().strip()
+            if word_item
+            else ""
+        )
+
+        pdf_path = (
+            pdf_item.text().strip()
+            if pdf_item
+            else ""
+        )
+
+        reply = QMessageBox.question(
+            self,
+            "Konfirmasi Hapus",
+            (
+                f"Apakah arsip berikut akan dihapus?\n\n"
+                f"Jenis   : {jenis}\n"
+                f"Pegawai : {pegawai}\n\n"
+                "Data arsip serta file Word dan PDF terkait "
+                "akan dihapus."
+            ),
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+
+        if reply != QMessageBox.Yes:
+            return
+
+        conn = get_connection()
+
+        try:
+
+            if jenis.lower() == "lembur":
+
+                # =================================================
+                # MULTI-TANGGAL:
+                # Hapus SEMUA detail yang memakai file Word yang
+                # sama.
+                #
+                # Ini juga aman untuk data lama karena setiap
+                # dokumen lama memiliki file_path sendiri.
+                # =================================================
+                if word_path:
+
+                    conn.execute(
+                        """
+                        DELETE FROM lembur
+                        WHERE file_path = ?
+                        """,
+                        (word_path,)
+                    )
+
+                else:
+                    # Fallback untuk record lama yang mungkin
+                    # belum memiliki file_path.
+                    ids = [
+                        x.strip()
+                        for x in record_id.split(",")
+                        if x.strip()
+                    ]
+
+                    for record in ids:
+
+                        conn.execute(
+                            """
+                            DELETE FROM lembur
+                            WHERE id = ?
+                            """,
+                            (record,)
+                        )
+
+            else:
+
+                # Surat Izin / Sakit / Cuti
+                conn.execute(
+                    """
+                    DELETE FROM surat
+                    WHERE id = ?
+                    """,
+                    (record_id,)
+                )
+
+            conn.commit()
+            conn.close()
+
+            # =================================================
+            # HAPUS FILE WORD DAN PDF
+            # =================================================
+            for file_path in [
+                word_path,
+                pdf_path
+            ]:
+
+                if not file_path:
+                    continue
+
+                try:
+
+                    path = Path(file_path)
+
+                    if path.exists():
+                        path.unlink()
+
+                except Exception as e:
+
+                    print(
+                        f"Gagal menghapus file "
+                        f"{file_path}: {e}"
+                    )
+
+            # =================================================
+            # REFRESH
+            # =================================================
+            self.load_archive()
+
+            self.statusBar().showMessage(
+                "Arsip berhasil dihapus."
+            )
+
+            QMessageBox.information(
+                self,
+                "Berhasil",
+                "Arsip dan file terkait berhasil dihapus."
+            )
+
+        except Exception as e:
+
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+            QMessageBox.critical(
+                self,
+                "Gagal Menghapus Arsip",
+                f"Arsip tidak dapat dihapus.\n\n{e}"
+            )
+
+    # ========================================================
+    # FILE OPEN
+    # ========================================================
+
+    def open_file(self, path):
+
+        path = Path(path)
+
+        if not path.exists():
+            QMessageBox.warning(
+                self,
+                "File Tidak Ditemukan",
+                str(path)
+            )
+            return
+
+        try:
+            os.startfile(
+                str(path)
+            )
+        except Exception as e:
+            QMessageBox.warning(
+                self,
+                "Tidak Bisa Membuka File",
+                str(e)
+            )
+
+    def open_folder(self, path):
+
+        path = Path(path)
+
+        if not path.exists():
+            QMessageBox.warning(
+                self,
+                "Folder Tidak Ditemukan",
+                str(path)
+            )
+            return
+
+        try:
+            os.startfile(
+                str(path)
+            )
+        except Exception as e:
+            QMessageBox.warning(
+                self,
+                "Tidak Bisa Membuka Folder",
+                str(e)
+            )
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+
+    try:
+        init_db()
+        ensure_archive_columns()
+
+    except Exception:
+        traceback.print_exc()
+
+        QMessageBox.critical(
+            None,
+            "Database Error",
+            "Database LetterSync tidak dapat dibuka."
+        )
+
+        return 1
+
+    app = QApplication(sys.argv)
+
+    app.setApplicationName(
+        "LetterSync"
+    )
+
+    app.setStyle(
+        "Fusion"
+    )
+
+    window = MainWindow()
+    window.show()
+
+    return app.exec()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
