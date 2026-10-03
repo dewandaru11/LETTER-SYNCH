@@ -1,4 +1,4 @@
-﻿from pathlib import Path
+from pathlib import Path
 import os
 import sys
 import sqlite3
@@ -53,15 +53,16 @@ from app.generator import render_template, create_pdf_from_docx
 
 # ============================================================
 # PATH
-# ============================================================
 
-BASE_DIR = Path(__file__).resolve().parent
+if getattr(sys, "frozen", False):
+    BASE_DIR = Path(sys.executable).resolve().parent
+else:
+    BASE_DIR = Path(__file__).resolve().parent
 
 OUTPUT_DIR = BASE_DIR / "output"
 WORD_DIR = OUTPUT_DIR / "word"
 PDF_DIR = OUTPUT_DIR / "pdf"
 TEMPLATE_DIR = BASE_DIR / "templates"
-
 WORD_DIR.mkdir(parents=True, exist_ok=True)
 PDF_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -1200,7 +1201,7 @@ class MainWindow(QMainWindow):
         # Icon surat
 
         hero_icon = QLabel(
-            "✉"
+            "?"
         )
 
         hero_icon.setAlignment(
@@ -1292,7 +1293,7 @@ class MainWindow(QMainWindow):
         # ----------------------------------------------------
 
         welcome = QLabel(
-            "Selamat Datang 👋"
+            "Selamat Datang ??"
         )
 
         welcome.setStyleSheet("""
@@ -1528,27 +1529,27 @@ class MainWindow(QMainWindow):
 
         quick_actions = [
             (
-                "＋  Pegawai",
+                "+  Pegawai",
                 1,
             ),
             (
-                "📝  Surat Izin",
+                "??  Surat Izin",
                 2,
             ),
             (
-                "🩺  Surat Sakit",
+                "??  Surat Sakit",
                 3,
             ),
             (
-                "🏖  Surat Cuti",
+                "??  Surat Cuti",
                 4,
             ),
             (
-                "⏰  Lembur",
+                "?  Lembur",
                 5,
             ),
             (
-                "🗂  Arsip",
+                "??  Arsip",
                 6,
             ),
         ]
@@ -1582,7 +1583,7 @@ class MainWindow(QMainWindow):
         # ----------------------------------------------------
 
         refresh_button = QPushButton(
-            "↻  Refresh Statistik"
+            "?  Refresh Statistik"
         )
 
         refresh_button.setMinimumHeight(
@@ -1615,7 +1616,7 @@ class MainWindow(QMainWindow):
 
         self.tabs.addTab(
             tab,
-            "🏠  Dashboard"
+            "??  Dashboard"
         )
 
         self.refresh_dashboard()
@@ -1825,7 +1826,7 @@ class MainWindow(QMainWindow):
         buttons = QHBoxLayout()
 
         btn_save = QPushButton(
-            "＋  Simpan Pegawai"
+            "+  Simpan Pegawai"
         )
 
         btn_save.clicked.connect(
@@ -1833,7 +1834,7 @@ class MainWindow(QMainWindow):
         )
 
         btn_refresh = QPushButton(
-            "↻  Refresh"
+            "?  Refresh"
         )
 
         btn_refresh.clicked.connect(
@@ -1841,7 +1842,7 @@ class MainWindow(QMainWindow):
         )
 
         btn_delete = QPushButton(
-            "🗑  Hapus Pegawai"
+            "??  Hapus Pegawai"
         )
 
         btn_delete.clicked.connect(
@@ -1900,7 +1901,7 @@ class MainWindow(QMainWindow):
 
         self.tabs.addTab(
             tab,
-            "👥  Pegawai"
+            "??  Pegawai"
         )
 
     # ========================================================
@@ -2334,6 +2335,12 @@ class MainWindow(QMainWindow):
             )
         )
 
+        self.i_lama_izin = QLineEdit()
+
+        self.i_lama_izin.setPlaceholderText(
+            "Contoh: 1 hari"
+        )
+
         self.i_keperluan = QTextEdit()
 
         form.addRow(
@@ -2347,6 +2354,11 @@ class MainWindow(QMainWindow):
         )
 
         form.addRow(
+            "Lama Izin:",
+            self.i_lama_izin,
+        )
+
+        form.addRow(
             "Keperluan:",
             self.i_keperluan,
         )
@@ -2356,7 +2368,7 @@ class MainWindow(QMainWindow):
         )
 
         self.i_save_button = QPushButton(
-            "📝  Simpan Surat Izin"
+            "??  Simpan Surat Izin"
         )
 
         self.i_save_button.clicked.connect(
@@ -2371,7 +2383,7 @@ class MainWindow(QMainWindow):
 
         self.tabs.addTab(
             tab,
-            "📝  Surat Izin"
+            "??  Surat Izin"
         )
 
     def save_izin(self):
@@ -2406,6 +2418,24 @@ class MainWindow(QMainWindow):
 
             return
 
+        lama_izin = (
+            self.i_lama_izin
+            .text()
+            .strip()
+        )
+
+        if not lama_izin:
+
+            QMessageBox.warning(
+                self,
+                "Data Belum Lengkap",
+                "Lama izin wajib diisi.",
+            )
+
+            self.i_lama_izin.setFocus()
+
+            return
+
         try:
 
             tanggal = parse_date(
@@ -2422,31 +2452,54 @@ class MainWindow(QMainWindow):
 
             return
 
+        nama = employee.get(
+            "nama",
+            "",
+        )
+
+        nip = employee.get(
+            "nip",
+            "",
+        )
+
+        jabatan = employee.get(
+            "jabatan",
+            "",
+        )
+
+        hari = format_day_id(
+            tanggal
+        )
+
+        tanggal_izin = format_date_id(
+            tanggal
+        )
+
         values = {
+
             "{{NAMA}}":
-                employee.get(
-                    "nama",
-                    "",
-                ),
+                nama,
+
+            "{{NIP}}":
+                nip,
 
             "{{JABATAN}}":
-                employee.get(
-                    "jabatan",
-                    "",
-                ),
+                jabatan,
 
             "{{HARI}}":
-                format_day_id(
-                    tanggal
-                ),
+                hari,
 
-            "{{TANGGAL_SURAT}}":
-                format_date_id(
-                    tanggal
-                ),
+            "{{TANGGAL_IZIN}}":
+                tanggal_izin,
+
+            "{{LAMA_IZIN}}":
+                lama_izin,
 
             "{{KEPERLUAN}}":
                 keperluan,
+
+            "{{TANGGAL_SURAT}}":
+                tanggal_izin,
         }
 
         self.start_letter_worker(
@@ -2456,6 +2509,7 @@ class MainWindow(QMainWindow):
             tanggal,
             values,
         )
+
 
     # ========================================================
     # SURAT SAKIT
@@ -2518,7 +2572,7 @@ class MainWindow(QMainWindow):
         )
 
         self.s_save_button = QPushButton(
-            "🩺  Simpan Surat Sakit"
+            "??  Simpan Surat Sakit"
         )
 
         self.s_save_button.clicked.connect(
@@ -2533,7 +2587,7 @@ class MainWindow(QMainWindow):
 
         self.tabs.addTab(
             tab,
-            "🩺  Surat Sakit"
+            "??  Surat Sakit"
         )
 
     def save_sakit(self):
@@ -2741,7 +2795,7 @@ class MainWindow(QMainWindow):
         )
 
         self.c_save_button = QPushButton(
-            "🏖  Simpan Surat Cuti"
+            "??  Simpan Surat Cuti"
         )
 
         self.c_save_button.clicked.connect(
@@ -2760,7 +2814,7 @@ class MainWindow(QMainWindow):
 
         self.tabs.addTab(
             tab,
-            "🏖  Surat Cuti"
+            "??  Surat Cuti"
         )
 
     def on_cuti_employee_changed(self):
@@ -3311,7 +3365,7 @@ class MainWindow(QMainWindow):
         # ----------------------------------------------------
 
         title = QLabel(
-            "⏰  LEMBUR"
+            "?  LEMBUR"
         )
 
         title.setStyleSheet("""
@@ -3681,7 +3735,7 @@ class MainWindow(QMainWindow):
         add_layout.addStretch()
 
         self.lembur_add_button = QPushButton(
-            "＋  Tambah Tanggal Lembur"
+            "+  Tambah Tanggal Lembur"
         )
 
         self.lembur_add_button.setMinimumHeight(
@@ -3856,7 +3910,7 @@ class MainWindow(QMainWindow):
         button_layout.addStretch()
 
         self.l_save_button = QPushButton(
-            "⏰  Buat Surat Lembur"
+            "?  Buat Surat Lembur"
         )
 
         self.l_save_button.setMinimumHeight(
@@ -3899,7 +3953,7 @@ class MainWindow(QMainWindow):
 
         self.tabs.addTab(
             self.lembur_tab,
-            "⏰  Lembur"
+            "?  Lembur"
         )
 
     # ========================================================
@@ -6015,3 +6069,4 @@ if __name__ == "__main__":
     sys.exit(
         main()
     )
+

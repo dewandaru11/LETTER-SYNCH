@@ -2,15 +2,23 @@ from pathlib import Path
 from docx import Document
 from datetime import datetime
 import subprocess
+import sys
 
 
-BASE_DIR = Path(__file__).resolve().parent.parent
+if getattr(sys, "frozen", False):
+    BASE_DIR = Path(sys.executable).resolve().parent
+    RESOURCE_DIR = Path(__file__).resolve().parent.parent
+else:
+    BASE_DIR = Path(__file__).resolve().parent.parent
+    RESOURCE_DIR = BASE_DIR
 
-TEMPLATE_DIR = BASE_DIR / "templates"
+
+TEMPLATE_DIR = RESOURCE_DIR / "templates"
 OUTPUT_DIR = BASE_DIR / "output"
 
 WORD_DIR = OUTPUT_DIR / "word"
 PDF_DIR = OUTPUT_DIR / "pdf"
+
 
 
 def _replace_in_paragraph(paragraph, replacements):
